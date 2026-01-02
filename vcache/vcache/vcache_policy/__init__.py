@@ -1,35 +1,138 @@
-from vcache.vcache_policy.strategies.benchmark_iid_verified import (
-    BenchmarkVerifiedIIDDecisionPolicy,
+"""
+vCache: Reliable and Efficient Semantic Prompt Caching
+"""
+
+# Main vCache classes
+from .config import VCacheConfig
+
+# Base classes
+# Concrete Inference engines
+from .inference_engine import (
+    BenchmarkInferenceEngine,
+    InferenceEngine,
+    LangChainInferenceEngine,
+    OpenAIInferenceEngine,
+    SiliconFlowInferenceEngine,
+    VLLMInferenceEngine,
 )
-from vcache.vcache_policy.strategies.benchmark_sigmoid_only import (
-    SigmoidOnlyDecisionPolicy,
+from .main import VCache
+from .vcache_core import (
+    Cache,
+    EmbeddingEngine,
+    EmbeddingMetadataObj,
+    EmbeddingMetadataStorage,
+    EmbeddingStore,
+    EvictionPolicy,
+    SimilarityEvaluator,
+    Statistics,
 )
-from vcache.vcache_policy.strategies.benchmark_sigmoid_probability import (
-    SigmoidProbabilityDecisionPolicy,
+
+# Concrete Embedding engines
+from .vcache_core.cache.embedding_engine import (
+    BenchmarkEmbeddingEngine,
+    LangChainEmbeddingEngine,
+    OpenAIEmbeddingEngine,
+    SiliconFlowEmbeddingEngine,
 )
-from vcache.vcache_policy.strategies.benchmark_static import (
+
+# Concrete Embedding metadata storage
+from .vcache_core.cache.embedding_store.embedding_metadata_storage import (
+    InMemoryEmbeddingMetadataStorage,
+    LangchainMetadataStorage,
+)
+
+# Concrete Vector databases
+from .vcache_core.cache.embedding_store.vector_db import (
+    ChromaVectorDB,
+    FAISSVectorDB,
+    HNSWLibVectorDB,
+    SimilarityMetricType,
+    VectorDB,
+)
+
+# Concrete Eviction policies
+from .vcache_core.cache.eviction_policy import (
+    FIFOEvictionPolicy,
+    LRUEvictionPolicy,
+    MRUEvictionPolicy,
+    NoEvictionPolicy,
+    SCUEvictionPolicy,
+)
+
+# Concrete Similarity evaluators
+from .vcache_core.similarity_evaluator import (
+    BenchmarkComparisonSimilarityEvaluator,
+    EmbeddingComparisonSimilarityEvaluator,
+    LLMComparisonSimilarityEvaluator,
+    StringComparisonSimilarityEvaluator,
+)
+
+# Concrete vCache Policies
+from .vcache_policy import (
     BenchmarkStaticDecisionPolicy,
-)
-from vcache.vcache_policy.strategies.benchmark_verified_global import (
     BenchmarkVerifiedGlobalDecisionPolicy,
-)
-from vcache.vcache_policy.strategies.no_cache import NoCachePolicy
-from vcache.vcache_policy.strategies.verified import (
+    BenchmarkVerifiedIIDDecisionPolicy,
+    NoCachePolicy,
+    SigmoidOnlyDecisionPolicy,
+    SigmoidProbabilityDecisionPolicy,
+    VCachePolicy,
     VerifiedDecisionPolicy,
-)
-from vcache.vcache_policy.strategies.verified_splitter import (
     VerifiedSplitterDecisionPolicy,
 )
-from vcache.vcache_policy.vcache_policy import VCachePolicy
 
 __all__ = [
+    # Main classes
+    "VCache",
+    "VCacheConfig",
+    # Base classes
     "VCachePolicy",
-    "BenchmarkStaticDecisionPolicy",
-    "SigmoidProbabilityDecisionPolicy",
-    "SigmoidOnlyDecisionPolicy",
+    "InferenceEngine",
+    "EmbeddingEngine",
+    "VectorDB",
+    "SimilarityEvaluator",
+    "EvictionPolicy",
+    "EmbeddingMetadataStorage",
+    "Cache",
+    "EmbeddingStore",
+    "Statistics",
+    # Concrete vCache Policies
     "VerifiedDecisionPolicy",
     "VerifiedSplitterDecisionPolicy",
+    "NoCachePolicy",
+    "SigmoidProbabilityDecisionPolicy",
+    "SigmoidOnlyDecisionPolicy",
+    "BenchmarkStaticDecisionPolicy",
     "BenchmarkVerifiedGlobalDecisionPolicy",
     "BenchmarkVerifiedIIDDecisionPolicy",
-    "NoCachePolicy",
+    # Concrete Inference engines
+    "OpenAIInferenceEngine",
+    "SiliconFlowInferenceEngine",
+    "LangChainInferenceEngine",
+    "VLLMInferenceEngine",
+    "BenchmarkInferenceEngine",
+    # Concrete Embedding engines
+    "OpenAIEmbeddingEngine",
+    "SiliconFlowEmbeddingEngine",
+    "LangChainEmbeddingEngine",
+    "BenchmarkEmbeddingEngine",
+    # Concrete Vector databases
+    "FAISSVectorDB",
+    "HNSWLibVectorDB",
+    "ChromaVectorDB",
+    "SimilarityMetricType",
+    # Concrete Similarity evaluators
+    "StringComparisonSimilarityEvaluator",
+    "LLMComparisonSimilarityEvaluator",
+    "EmbeddingComparisonSimilarityEvaluator",
+    "BenchmarkComparisonSimilarityEvaluator",
+    # Concrete Eviction policies
+    "LRUEvictionPolicy",
+    "MRUEvictionPolicy",
+    "FIFOEvictionPolicy",
+    "NoEvictionPolicy",
+    "SCUEvictionPolicy",
+    # Concrete Embedding metadata storage
+    "InMemoryEmbeddingMetadataStorage",
+    "LangchainMetadataStorage",
+    "EmbeddingMetadataObj",
 ]

@@ -1,0 +1,80 @@
+2026-01-01 19:02:28,922 INFO:Using Hugging Face dataset: vCache/SemBenchmarkClassification
+2026-01-01 19:02:28,922 INFO:
+Running benchmark for dataset: vCache/SemBenchmarkClassification, embedding model: GteLargeENv1_5, LLM model: Llama_3_8B_Instruct
+
+2026-01-01 19:02:28,922 INFO:vCache Local: Using dynamic threshold with delta: 0.02. Run 1 of 1
+2026-01-01 19:02:28,923 INFO:Loading Hugging Face dataset: vCache/SemBenchmarkClassification
+2026-01-01 19:02:38,937 WARNING:'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /datasets/vCache/SemBenchmarkClassification/resolve/main/README.md (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x724334aa1e50>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: 3721c430-4223-4e17-a302-0cbd406ecf6f)')' thrown while requesting HEAD https://huggingface.co/datasets/vCache/SemBenchmarkClassification/resolve/main/README.md
+2026-01-01 19:02:38,937 WARNING:Retrying in 1s [Retry 1/5].
+2026-01-01 19:02:49,969 WARNING:'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /datasets/vCache/SemBenchmarkClassification/resolve/main/README.md (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x724333ae1d50>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: 1e831072-64e2-4677-921d-6fd2c1119e8b)')' thrown while requesting HEAD https://huggingface.co/datasets/vCache/SemBenchmarkClassification/resolve/main/README.md
+2026-01-01 19:02:49,970 WARNING:Retrying in 2s [Retry 2/5].
+2026-01-01 19:03:02,004 WARNING:'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /datasets/vCache/SemBenchmarkClassification/resolve/main/README.md (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x724333ae2190>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: db356be9-827f-4a8a-93b9-2fa08ba49f32)')' thrown while requesting HEAD https://huggingface.co/datasets/vCache/SemBenchmarkClassification/resolve/main/README.md
+2026-01-01 19:03:02,004 WARNING:Retrying in 4s [Retry 3/5].
+2026-01-01 19:03:16,016 WARNING:'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /datasets/vCache/SemBenchmarkClassification/resolve/main/README.md (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x724333ae3390>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: f38e4aec-2d94-4e42-84ab-b29cad96d007)')' thrown while requesting HEAD https://huggingface.co/datasets/vCache/SemBenchmarkClassification/resolve/main/README.md
+2026-01-01 19:03:16,017 WARNING:Retrying in 8s [Retry 4/5].
+2026-01-01 19:03:34,033 WARNING:'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /datasets/vCache/SemBenchmarkClassification/resolve/main/README.md (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x724333ae4750>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: bc888177-f4d0-4896-bcc9-07ba5c8bf6d3)')' thrown while requesting HEAD https://huggingface.co/datasets/vCache/SemBenchmarkClassification/resolve/main/README.md
+2026-01-01 19:03:34,034 WARNING:Retrying in 8s [Retry 5/5].
+2026-01-01 19:03:52,046 WARNING:'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /datasets/vCache/SemBenchmarkClassification/resolve/main/README.md (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x724333ae5890>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: cba9fb3f-f996-42d7-be7f-966bc7ce5b94)')' thrown while requesting HEAD https://huggingface.co/datasets/vCache/SemBenchmarkClassification/resolve/main/README.md
+2026-01-01 19:04:02,062 WARNING:'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /datasets/vCache/SemBenchmarkClassification/resolve/373719c21898ba0914b1934e88e0486de2420c02/SemBenchmarkClassification.py (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x724333ae7fd0>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: 2c927d72-4f8d-48b8-b161-2c881dbe6889)')' thrown while requesting HEAD https://huggingface.co/datasets/vCache/SemBenchmarkClassification/resolve/373719c21898ba0914b1934e88e0486de2420c02/SemBenchmarkClassification.py
+2026-01-01 19:04:02,062 WARNING:Retrying in 1s [Retry 1/5].
+2026-01-01 19:04:13,079 WARNING:'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /datasets/vCache/SemBenchmarkClassification/resolve/373719c21898ba0914b1934e88e0486de2420c02/SemBenchmarkClassification.py (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x724333ae9010>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: a49ae2a8-224f-4691-bdb2-36cfe5b5a95d)')' thrown while requesting HEAD https://huggingface.co/datasets/vCache/SemBenchmarkClassification/resolve/373719c21898ba0914b1934e88e0486de2420c02/SemBenchmarkClassification.py
+2026-01-01 19:04:13,079 WARNING:Retrying in 2s [Retry 2/5].
+2026-01-02 14:26:43,645 INFO:Using Hugging Face dataset: vCache/SemBenchmarkClassification
+2026-01-02 14:26:43,645 INFO:
+Running benchmark for dataset: vCache/SemBenchmarkClassification, embedding model: GteLargeENv1_5, LLM model: Llama_3_8B_Instruct
+
+2026-01-02 14:26:43,645 INFO:vCache Local: Using dynamic threshold with delta: 0.02. Run 1 of 1
+2026-01-02 14:26:43,646 INFO:Loading Hugging Face dataset: vCache/SemBenchmarkClassification
+2026-01-02 14:27:04,193 ERROR:Error processing benchmark: An error occurred while generating the dataset
+2026-01-02 14:27:04,796 INFO:LLM Model Time: 0.35 minutes, 0.0059 hours
+2026-01-02 14:27:04,797 INFO:All benchmarks completed in 0.02 hours!
+2026-01-02 14:27:04,798 INFO:Shutting down eviction thread pool.
+2026-01-02 14:27:04,798 INFO:Shutting down eviction thread pool.
+2026-01-02 14:27:04,798 INFO:Shutting down eviction thread pool.
+2026-01-02 14:27:04,798 INFO:Shutting down eviction thread pool.
+2026-01-02 14:27:04,798 INFO:Shutting down eviction thread pool.
+2026-01-02 14:27:04,798 INFO:Shutting down eviction thread pool.
+2026-01-02 14:27:04,798 INFO:Shutting down eviction thread pool.
+2026-01-02 14:28:29,610 INFO:Using Hugging Face dataset: vCache/SemBenchmarkClassification
+2026-01-02 14:28:29,610 INFO:
+Running benchmark for dataset: vCache/SemBenchmarkClassification, embedding model: GteLargeENv1_5, LLM model: Llama_3_8B_Instruct
+
+2026-01-02 14:28:29,610 INFO:vCache Local: Using dynamic threshold with delta: 0.02. Run 1 of 1
+2026-01-02 14:28:29,610 INFO:Loading Hugging Face dataset: vCache/SemBenchmarkClassification
+2026-01-02 14:28:29,611 WARNING:Using the latest cached version of the dataset since vCache/SemBenchmarkClassification couldn't be found on the Hugging Face Hub (offline mode is enabled).
+2026-01-02 14:28:29,611 WARNING:Found the latest cached dataset configuration 'default' at /data2/ali/hf/datasets/vCache___sem_benchmark_classification/default/0.0.0/373719c21898ba0914b1934e88e0486de2420c02 (last modified on Mon Dec 29 18:38:39 2025).
+2026-01-02 14:28:29,632 INFO:Running benchmark loop
+2026-01-02 14:28:29,633 INFO:data_entries: Dataset({
+    features: ['dataset_name', 'id', 'output_format', 'emb_gte', 'emb_gte_lat', 'emb_gte_ft', 'emb_gte_ft_lat', 'emb_e5_mistral_7b', 'emb_e5_mistral_7b_lat', 'emb_e5_large_v2', 'emb_e5_large_v2_lat', 'emb_e5_large_v2_ft', 'emb_e5_large_v2_ft_lat', 'response_llama_3_8b', 'response_llama_3_8b_lat', 'response_llama_3_70b', 'response_llama_3_70b_lat', 'prompt', 'response_llama_3_70b_vllm', 'response_llama_3_70b_vllm_lat'],
+    num_rows: 45000
+})
+2026-01-02 14:29:10,721 INFO:Shutting down eviction thread pool.
+2026-01-02 14:29:10,721 INFO:Shutting down eviction thread pool.
+2026-01-02 14:29:10,721 INFO:Shutting down eviction thread pool.
+2026-01-02 14:29:10,721 INFO:Shutting down eviction thread pool.
+2026-01-02 14:29:10,721 INFO:Shutting down eviction thread pool.
+2026-01-02 14:29:10,721 INFO:Shutting down eviction thread pool.
+2026-01-02 14:29:10,721 INFO:Shutting down eviction thread pool.
+2026-01-02 14:29:32,872 INFO:Using Hugging Face dataset: vCache/SemBenchmarkClassification
+2026-01-02 14:29:32,872 INFO:
+Running benchmark for dataset: vCache/SemBenchmarkClassification, embedding model: GteLargeENv1_5, LLM model: Llama_3_8B_Instruct
+
+2026-01-02 14:29:32,872 INFO:vCache Local: Using dynamic threshold with delta: 0.02. Run 1 of 1
+2026-01-02 14:29:32,873 INFO:Loading Hugging Face dataset: vCache/SemBenchmarkClassification
+2026-01-02 14:29:32,873 WARNING:Using the latest cached version of the dataset since vCache/SemBenchmarkClassification couldn't be found on the Hugging Face Hub (offline mode is enabled).
+2026-01-02 14:29:32,873 WARNING:Found the latest cached dataset configuration 'default' at /data2/ali/hf/datasets/vCache___sem_benchmark_classification/default/0.0.0/373719c21898ba0914b1934e88e0486de2420c02 (last modified on Mon Dec 29 18:38:39 2025).
+2026-01-02 14:29:32,895 INFO:Running benchmark loop
+2026-01-02 14:29:32,896 INFO:data_entries: Dataset({
+    features: ['dataset_name', 'id', 'output_format', 'emb_gte', 'emb_gte_lat', 'emb_gte_ft', 'emb_gte_ft_lat', 'emb_e5_mistral_7b', 'emb_e5_mistral_7b_lat', 'emb_e5_large_v2', 'emb_e5_large_v2_lat', 'emb_e5_large_v2_ft', 'emb_e5_large_v2_ft_lat', 'response_llama_3_8b', 'response_llama_3_8b_lat', 'response_llama_3_70b', 'response_llama_3_70b_lat', 'prompt', 'response_llama_3_70b_vllm', 'response_llama_3_70b_vllm_lat'],
+    num_rows: 45000
+})
+2026-01-02 14:35:46,916 INFO:Results successfully dumped to /home/ali/vcahce/benchmarks/results/vCache/SemBenchmarkClassification/GteLargeENv1_5/Llama_3_8B_Instruct/vcache_local_0.02_run_1/results_2026-01-02_14-29.json
+2026-01-02 14:35:51,663 INFO:LLM Model Time: 6.31 minutes, 0.1052 hours
+2026-01-02 14:35:51,664 INFO:All benchmarks completed in 0.11 hours!
+2026-01-02 14:35:51,664 INFO:Shutting down eviction thread pool.
+2026-01-02 14:35:51,664 INFO:Shutting down eviction thread pool.
+2026-01-02 14:35:51,665 INFO:Shutting down eviction thread pool.
+2026-01-02 14:35:51,665 INFO:Shutting down eviction thread pool.
+2026-01-02 14:35:51,665 INFO:Shutting down eviction thread pool.
+2026-01-02 14:35:51,665 INFO:Shutting down eviction thread pool.
+2026-01-02 14:35:51,665 INFO:Shutting down eviction thread pool.

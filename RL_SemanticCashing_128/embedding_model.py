@@ -1,0 +1,205 @@
+import os
+# Set HuggingFace mirror endpoint before importing transformers
+# This MUST be set before any huggingface_hub or transformers imports
+if 'HF_ENDPOINT' not in os.environ:
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+elif 'hf-mirror.com' not in os.environ.get('HF_ENDPOINT', ''):
+    # Override if not using mirror
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+from transformers import AutoModel, AutoTokenizer
+import torch  
+
+class EmbeddingModel:
+    """ 计算文本的向量嵌入 """
+    def __init__(self, model_name=None, device=None):
+        # Default backbone:
+        # - Prefer explicit user choice via env var, otherwise use a tiny BERT with hidden_size=128
+        #   so the policy can run without projecting 768 -> 128.
+        # - If you want a stronger encoder (but larger hidden size), pass model_name explicitly
+        #   or set EMBEDDING_MODEL_NAME accordingly (e.g., bert-base-uncased).
+        if model_name is None:
+            model_name = os.environ.get("EMBEDDING_MODEL_NAME") or "prajjwal1/bert-tiny"
+
+        if os.path.isdir(model_name):
+            tok_json = os.path.join(model_name, "tokenizer.json")
+            if os.path.isfile(tok_json):
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name, tokenizer_file=tok_json, local_files_only=True)
+            else:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+            self.model = AutoModel.from_pretrained(model_name, local_files_only=True)
+        else:
+            # Use HuggingFace hub (model_name is a valid repo ID)
+            # Ensure HF_ENDPOINT is set for mirror usage
+            hf_endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co')
+            if 'hf-mirror.com' not in hf_endpoint:
+                print(f"[WARNING] HF_ENDPOINT is not set to hf-mirror.com, current value: {hf_endpoint}")
+                print(f"[INFO] Setting HF_ENDPOINT to https://hf-mirror.com")
+                os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+            
+            print(f"[INFO] Loading model {model_name} from {os.environ.get('HF_ENDPOINT')}")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name)
+
+        # Move model to specified device if provided
+        if device is not None:
+            self.model.to(device)
+            print(f"[DEVICE] EmbeddingModel moved to {device}")
+        else:
+            current_device = next(self.model.parameters()).device
+            print(f"[DEVICE] EmbeddingModel loaded on {current_device}")
+
+        self.model.eval()
+
+    def get_embedding(self, text):
+        """ 获取文本的向量嵌入 """
+      
+        device = next(self.model.parameters()).device
+    
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        
+        return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+    def get_token_embeddings(self, texts, max_length=None, device=None, return_device=None):
+        """
+        获取token级别的嵌入（用于指针网络输入）
+        
+        Args:
+            texts: 字符串列表
+            max_length: 最大长度，None则使用模型默认
+            device: 指定设备
+        
+        Returns:
+            dict: 包含 'last_hidden_state', 'input_ids', 'attention_mask'
+        """
+      
+        batch_size_total = len(texts)
+        if batch_size_total == 0:
+            raise ValueError("texts 不能为空")
+
+        chunk_size = min(8, max(1, batch_size_total // 2)) 
+
+        hidden_states_list = []
+        input_ids_list = []
+        attention_mask_list = []
+
+        # NOTE: When RL4CO builds datasets, it may call the generator with very large batch_size
+        # (e.g., thousands). Keeping all token embeddings on GPU will OOM. To avoid this, we
+        # optionally stream chunk outputs to `return_device` (often CPU) before concatenation.
+        with torch.no_grad():
+            for start_idx in range(0, batch_size_total, chunk_size):
+                end_idx = min(start_idx + chunk_size, batch_size_total)
+                texts_chunk = texts[start_idx:end_idx]
+
+                if max_length is not None:
+                    inputs = self.tokenizer(
+                        texts_chunk, return_tensors="pt", padding='max_length',
+                        truncation=True, max_length=max_length
+                    )
+                else:
+                    inputs = self.tokenizer(texts_chunk, return_tensors="pt", padding=True, truncation=True)
+
+                if device is not None:
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+                if device is not None and torch.cuda.is_available():
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        outputs = self.model(**inputs)
+                else:
+                    outputs = self.model(**inputs)
+
+                hs = outputs.last_hidden_state
+                ids = inputs["input_ids"]
+                attn = inputs.get("attention_mask", None)
+
+                if return_device is not None:
+                    hs = hs.to(return_device)
+                    ids = ids.to(return_device)
+                    if attn is not None:
+                        attn = attn.to(return_device)
+
+                hidden_states_list.append(hs)
+                input_ids_list.append(ids)
+                attention_mask_list.append(attn)
+
+                
+                del outputs, hs
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+        last_hidden_state = torch.cat(hidden_states_list, dim=0)
+        input_ids = torch.cat(input_ids_list, dim=0)
+        attention_mask = None
+        if all(m is not None for m in attention_mask_list):
+            attention_mask = torch.cat(attention_mask_list, dim=0)
+
+        return {
+            'last_hidden_state': last_hidden_state,
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
+        }
+    
+    def encode(self, texts, convert_to_tensor=False, device=None):
+        """
+        兼容SentenceTransformer的encode方法
+        支持单个字符串或字符串列表
+        
+        Args:
+            texts: 单个字符串或字符串列表
+            convert_to_tensor: 是否返回tensor，默认False返回numpy数组
+            device: 如果convert_to_tensor=True，指定tensor的设备
+        
+        Returns:
+            如果convert_to_tensor=False: numpy数组 shape=(n, embedding_dim) 或 (embedding_dim,)
+            如果convert_to_tensor=True: torch.Tensor shape=(n, embedding_dim) 或 (embedding_dim,)
+        """
+        # 处理单个字符串输入
+        if isinstance(texts, str):
+            texts = [texts]
+            single_input = True
+        else:
+            single_input = False
+        
+        # 分块编码
+        batch_size_total = len(texts)
+        chunk_size = min(16, max(1, batch_size_total // 2))
+        emb_list = []
+
+        if device is not None:
+            self.model.to(device)
+
+        with torch.no_grad():
+            for start_idx in range(0, batch_size_total, chunk_size):
+                end_idx = min(start_idx + chunk_size, batch_size_total)
+                texts_chunk = texts[start_idx:end_idx]
+                inputs = self.tokenizer(texts_chunk, return_tensors="pt", padding=True, truncation=True)
+                if device is not None:
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+                if device is not None and torch.cuda.is_available():
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        outputs = self.model(**inputs)
+                else:
+                    outputs = self.model(**inputs)
+
+                emb_list.append(outputs.last_hidden_state.mean(dim=1))
+                del outputs
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+        embeddings = torch.cat(emb_list, dim=0)
+        
+        if convert_to_tensor:
+            return embeddings.squeeze(0) if single_input else embeddings
+        else:
+            result = embeddings.cpu().numpy()
+            return result.squeeze(0) if single_input else result
+
+if __name__ == "__main__":
+    embedder = EmbeddingModel()
+    embedding = embedder.get_embedding("What is the capital of France?")
+    print(embedding.shape)

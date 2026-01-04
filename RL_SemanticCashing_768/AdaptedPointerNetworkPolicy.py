@@ -59,12 +59,17 @@ class AdaptedPointerNetworkPolicy(nn.Module):
                  hidden_dim=128,        
                  max_segments=6,       
                  nhead=4,               
-                 num_encoder_layers=2  
+                 num_encoder_layers=2,
+                 *,
+                 policy_mode: str = "joint",
                 ):
         super().__init__()
         self.env = env
         self.hidden_dim = hidden_dim
         self.max_segments = max_segments
+        self.policy_mode = str(policy_mode).lower().strip()
+        if self.policy_mode not in {"joint", "separate"}:
+            raise ValueError(f"Unsupported policy_mode={policy_mode!r}. Use 'joint' or 'separate'.")
       
         self.train_decode_type = "sampling"
         self.val_decode_type = "greedy"
@@ -170,6 +175,152 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             "likewise",
             "similarly",
         ]
+
+    def _decode_single(
+        self,
+        *,
+        encoder_outputs: torch.Tensor,  # [B, L, H]
+        input_ids: torch.Tensor,  # [B, L]
+        eff_len: torch.Tensor,  # [B]
+        decode_type: str,
+        debug: bool = False,
+        debug_topk: int = 8,
+        debug_n_samples: int = 1,
+        side: str = "A",
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        Decode segmentation pointers for a single sequence (factorized policy mode).
+
+        Returns:
+        - pointers: [B, max_segments] (token positions)
+        - logp: [B] (sum log-prob over steps)
+        - info: dict of diagnostics + optional debug_records
+        """
+        batch_size, seq_len, _ = encoder_outputs.shape
+
+        # Precompute punctuation mask [B, L]
+        is_punct_global = torch.isin(input_ids, self._valid_split_ids)
+
+        # Decoder init
+        decoder_input = self.decoder_start_input.unsqueeze(0).repeat(batch_size, 1)
+        h = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device)
+        c = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device)
+        current_b = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+
+        pointers_steps = []
+        logp_steps = []
+        valid_counts_steps = []
+        had_any_valid_steps = []
+        debug_records = []
+
+        # Precompute ctx [B, H, L] for efficiency inside the loop
+        ctx = self.attention_linear_encoder(encoder_outputs.permute(0, 2, 1))
+        V_exp = self.V.unsqueeze(0).expand(batch_size, -1).unsqueeze(1)
+        mask_fill_val = float("-inf")
+
+        for step in range(self.max_segments):
+            h, c = self.decoder_cell(decoder_input, (h, c))
+            query_vec = self.attention_linear_decoder(h)  # [B, H]
+
+            rng = torch.arange(seq_len, device=self.device).expand(batch_size, -1)
+            is_future = rng > current_b.unsqueeze(1)
+            is_in_len = rng < (eff_len - 1).unsqueeze(1)
+            valid_slots = is_punct_global & is_future & is_in_len
+            mask_ptr = ~valid_slots
+
+            valid_counts_steps.append(valid_slots.sum(dim=1))
+            had_any_valid_steps.append(valid_slots.any(dim=1))
+
+            inp = query_vec.unsqueeze(2)  # [B, H, 1]
+            attn_scores = torch.bmm(V_exp, torch.tanh(inp + ctx)).squeeze(1)  # [B, L]
+            attn_scores = attn_scores.masked_fill(mask_ptr, mask_fill_val)
+
+            pointer = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+            logp = torch.zeros(batch_size, device=self.device)
+
+            has_valid = valid_slots.any(dim=1)
+            if has_valid.any():
+                rows = has_valid
+                if decode_type == "sampling":
+                    dist = Categorical(logits=attn_scores[rows])
+                    act = dist.sample()
+                    pointer[rows] = act
+                    logp[rows] = dist.log_prob(act)
+                else:
+                    pointer[rows] = torch.argmax(attn_scores[rows], dim=1)
+
+            if (~has_valid).any():
+                rows = ~has_valid
+                pointer[rows] = (eff_len[rows] - 1).clamp(min=1)
+
+            if debug:
+                n_dbg = min(int(debug_n_samples), batch_size)
+                for bi in range(n_dbg):
+                    pb = int(pointer[bi].item())
+                    ids_row = input_ids[bi]
+
+                    def _pos_to_tok(seq_ids, pos):
+                        try:
+                            tok_id = int(seq_ids[pos].item())
+                        except Exception:
+                            tok_id = int(seq_ids[pos])
+                        try:
+                            return self.tokenizer.convert_ids_to_tokens(tok_id)
+                        except Exception:
+                            return str(tok_id)
+
+                    debug_records.append(
+                        {
+                            "side": side,
+                            "step": int(step),
+                            "sample": int(bi),
+                            "current_boundary": int(current_b[bi].item()),
+                            "eff_len": int(eff_len[bi].item()),
+                            "n_valid": int(valid_slots[bi].sum().item()),
+                            "chosen_pos": pb,
+                            "chosen_tok": _pos_to_tok(ids_row, pb),
+                            "fallback": bool((~has_valid)[bi].item()),
+                            "chosen_is_valid": bool(valid_slots[bi, pb].item()) if pb < valid_slots.size(1) else False,
+                        }
+                    )
+
+            # Segment pooling for feedback (uses encoder_outputs, already in hidden_dim)
+            feedback = torch.zeros(batch_size, self.hidden_dim, device=self.device)
+            for b in range(batch_size):
+                s = int(current_b[b].item())
+                e = int(pointer[b].item())
+                real_start = (s + 1) if s > 0 else 1  # skip [CLS]
+                real_end = e + 1  # inclusive boundary
+                if real_end > real_start:
+                    feedback[b] = encoder_outputs[b, real_start:real_end].mean(dim=0)
+                else:
+                    feedback[b].zero_()
+            decoder_input = feedback
+
+            current_b = pointer
+            pointers_steps.append(pointer)
+            logp_steps.append(logp)
+
+        pointers = torch.stack(pointers_steps, dim=1)  # [B, K]
+        logp_total = torch.stack(logp_steps, dim=1).sum(dim=1)  # [B]
+
+        info = {}
+        try:
+            vc = torch.stack(valid_counts_steps, dim=1).float()
+            hv = torch.stack(had_any_valid_steps, dim=1)
+            info.update(
+                {
+                    f"avg_valid_{side.lower()}": vc.mean().detach(),
+                    f"min_valid_{side.lower()}": vc.min().detach(),
+                    f"frac_any_valid_{side.lower()}": hv.float().mean().detach(),
+                }
+            )
+        except Exception:
+            pass
+        if debug:
+            info["debug_records"] = debug_records
+
+        return pointers, logp_total, info
     def _init_punctuation_ids(self, device):
         """
         初始化有效的分割token ID集合。
@@ -248,6 +399,114 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             "info": info,
         }
 
+    def _move_td_keys_to_device(self, td, keys: list[str], device: torch.device):
+        """Best-effort helper: move a subset of TensorDict keys to device."""
+        try:
+            return td.to(device)
+        except Exception:
+            for k in keys:
+                if k in td and isinstance(td[k], torch.Tensor):
+                    td[k] = td[k].to(device)
+            return td
+
+    def forward_single(
+        self,
+        td,
+        *,
+        decode_type: str = "sampling",
+        key_suffix: str | None = None,
+        side: str = "S",
+        **kwargs,
+    ):
+        """
+        Single-text policy forward φ(text): runs the pointer decoder on ONE sequence only.
+
+        This is the API you asked for: you can call it twice as:
+          out_a = policy.forward_single(td_pair, key_suffix="a", side="A")
+          out_b = policy.forward_single(td_pair, key_suffix="b", side="B")
+        then interleave actions and compute pair reward.
+
+        Supported input formats:
+        - Pair TensorDict (current generator/env format): keys end with `_a` / `_b`
+          (use key_suffix="a" or "b")
+        - Single TensorDict: keys without suffixes: token_embeddings, attention_mask, input_ids, length
+          (use key_suffix=None)
+
+        Returns dict with:
+        - actions: [B, max_segments]  (pointer positions)
+        - log_likelihood: [B]
+        - info: dict (may include debug_records)
+
+        NOTE: This does NOT compute reward (your reward is pair-based in MaxSimEnv).
+        """
+        debug = bool(kwargs.pop("debug", False))
+        debug_topk = int(kwargs.pop("debug_topk", 8))
+        debug_n_samples = int(kwargs.pop("debug_n_samples", 1))
+
+        # Ensure module + data are on the LM/policy device
+        target_device = next(self.lm.parameters()).device
+        if getattr(self, "_current_module_device", None) != target_device:
+            self.to(target_device)
+            self._current_module_device = target_device
+        self._device = target_device
+
+        if key_suffix is None:
+            emb_k = "token_embeddings"
+            attn_k = "attention_mask"
+            ids_k = "input_ids"
+            len_k = "length"
+        else:
+            suf = str(key_suffix).lower().strip()
+            if suf not in {"a", "b"}:
+                raise ValueError(f"key_suffix must be 'a', 'b', or None; got {key_suffix!r}")
+            emb_k = f"token_embeddings_{suf}"
+            attn_k = f"attention_mask_{suf}"
+            ids_k = f"input_ids_{suf}"
+            len_k = f"length_{suf}"
+
+        td = self._move_td_keys_to_device(td, [emb_k, attn_k, ids_k, len_k], target_device)
+
+        # Initialize split markers (punctuation/connector ids) once per device
+        self._init_punctuation_ids(td[ids_k].device)
+
+        # Lazily build projection to hidden_dim
+        input_dim = td[emb_k].size(-1)
+        if self.input_proj is None:
+            with torch.inference_mode(False):
+                if input_dim == self.hidden_dim:
+                    self.input_proj = nn.Identity()
+                else:
+                    self.input_proj = nn.Linear(input_dim, self.hidden_dim)
+            self.input_proj.to(self.device)
+
+        encoder_outputs = self.input_proj(td[emb_k])  # [B, L, H]
+
+        # Effective length excludes trailing [SEP]/[EOS] from selectable range
+        length = td[len_k].long()
+        last_idx = (length - 1).clamp(min=0)
+        last_tok = td[ids_k].gather(1, last_idx.unsqueeze(1)).squeeze(1)
+        sep_id = getattr(self.tokenizer, "sep_token_id", None)
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        is_last_special = torch.zeros_like(last_tok, dtype=torch.bool)
+        if sep_id is not None:
+            is_last_special |= last_tok == sep_id
+        if eos_id is not None:
+            is_last_special |= last_tok == eos_id
+        eff_len = (length - is_last_special.long()).clamp(min=2)
+
+        pointers, logp, info = self._decode_single(
+            encoder_outputs=encoder_outputs,
+            input_ids=td[ids_k],
+            eff_len=eff_len,
+            decode_type=str(decode_type),
+            debug=debug,
+            debug_topk=debug_topk,
+            debug_n_samples=debug_n_samples,
+            side=str(side),
+        )
+
+        return {"actions": pointers, "log_likelihood": logp, "info": info}
+
     def _forward(self, td, decode_type="sampling", **kwargs):
         """
         实现自回归解码的核心逻辑 。
@@ -296,6 +555,89 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         batch_size = embedded_a.size(0)
         seq_len_a = embedded_a.size(1)
         seq_len_b = embedded_b.size(1)
+
+        # Compute "effective lengths" that exclude trailing [SEP]/[EOS] from the selectable range.
+        length_a = td["length_a"].long()
+        length_b = td["length_b"].long()
+        last_idx_a = (length_a - 1).clamp(min=0)
+        last_idx_b = (length_b - 1).clamp(min=0)
+        last_tok_a = td["input_ids_a"].gather(1, last_idx_a.unsqueeze(1)).squeeze(1)
+        last_tok_b = td["input_ids_b"].gather(1, last_idx_b.unsqueeze(1)).squeeze(1)
+
+        sep_id = getattr(self.tokenizer, "sep_token_id", None)
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+
+        is_last_special_a = torch.zeros_like(last_tok_a, dtype=torch.bool)
+        is_last_special_b = torch.zeros_like(last_tok_b, dtype=torch.bool)
+        if sep_id is not None:
+            is_last_special_a |= last_tok_a == sep_id
+            is_last_special_b |= last_tok_b == sep_id
+        if eos_id is not None:
+            is_last_special_a |= last_tok_a == eos_id
+            is_last_special_b |= last_tok_b == eos_id
+
+        eff_len_a = (length_a - is_last_special_a.long()).clamp(min=2)
+        eff_len_b = (length_b - is_last_special_b.long()).clamp(min=2)
+
+        # ============================
+        # Separate (factorized) mode:
+        # run phi(x) and phi(y) independently (shared weights), then interleave actions.
+        # ============================
+        if self.policy_mode == "separate":
+            # Use the single-text API twice (φ(x), φ(y)), then combine.
+            out_a = self.forward_single(
+                td,
+                decode_type=decode_type,
+                key_suffix="a",
+                side="A",
+                debug=debug,
+                debug_topk=debug_topk,
+                debug_n_samples=debug_n_samples,
+            )
+            out_b = self.forward_single(
+                td,
+                decode_type=decode_type,
+                key_suffix="b",
+                side="B",
+                debug=debug,
+                debug_topk=debug_topk,
+                debug_n_samples=debug_n_samples,
+            )
+            pa, logp_a, info_a = out_a["actions"], out_a["log_likelihood"], out_a.get("info", {})
+            pb, logp_b, info_b = out_b["actions"], out_b["log_likelihood"], out_b.get("info", {})
+
+            plan = torch.stack([pa, pb], dim=2)  # [B, K, 2] => [A0,B0,...]
+            actions = plan.view(batch_size, -1)  # [B, 2*K]
+            log_likelihood = logp_a + logp_b
+
+            info = {}
+            info.update({k: v for k, v in info_a.items() if k != "debug_records"})
+            info.update({k: v for k, v in info_b.items() if k != "debug_records"})
+            if debug:
+                # Merge debug records if present
+                recs = []
+                recs.extend(info_a.get("debug_records", []))
+                recs.extend(info_b.get("debug_records", []))
+                info["debug_records"] = recs
+
+                if debug_print:
+                    for r in recs:
+                        if "chosen_pos" in r:
+                            print(
+                                f"[DBG][{r.get('side','?')}] step={r['step']} sample={r['sample']} "
+                                f"pos={r['chosen_pos']} tok={r.get('chosen_tok')} "
+                                f"valid={r.get('chosen_is_valid')} fallback={r.get('fallback')}"
+                            )
+                if debug_log_path:
+                    try:
+                        import json
+                        with open(debug_log_path, "a", encoding="utf-8") as f:
+                            for r in recs:
+                                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    except Exception as e:
+                        info["debug_log_error"] = str(e)
+
+            return actions, log_likelihood, info
         
         # --- 2. Encoder (Cross-Attention) ---
         for layer in self.encoder_layers:
@@ -330,30 +672,6 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         is_punct_global_a = torch.isin(td['input_ids_a'], self._valid_split_ids)
         is_punct_global_b = torch.isin(td['input_ids_b'], self._valid_split_ids)
 
-        # Compute "effective lengths" that exclude a trailing [SEP]/[EOS] token from the selectable range.
-        # Many BERT-style tokenizers produce: [CLS] ... tokens ... [SEP] [PAD]...
-        # We don't want the policy to pick that terminal special token as a split boundary.
-        length_a = td["length_a"].long()
-        length_b = td["length_b"].long()
-        last_idx_a = (length_a - 1).clamp(min=0)
-        last_idx_b = (length_b - 1).clamp(min=0)
-        last_tok_a = td["input_ids_a"].gather(1, last_idx_a.unsqueeze(1)).squeeze(1)
-        last_tok_b = td["input_ids_b"].gather(1, last_idx_b.unsqueeze(1)).squeeze(1)
-
-        sep_id = getattr(self.tokenizer, "sep_token_id", None)
-        eos_id = getattr(self.tokenizer, "eos_token_id", None)
-
-        is_last_special_a = torch.zeros_like(last_tok_a, dtype=torch.bool)
-        is_last_special_b = torch.zeros_like(last_tok_b, dtype=torch.bool)
-        if sep_id is not None:
-            is_last_special_a |= last_tok_a == sep_id
-            is_last_special_b |= last_tok_b == sep_id
-        if eos_id is not None:
-            is_last_special_a |= last_tok_a == eos_id
-            is_last_special_b |= last_tok_b == eos_id
-
-        eff_len_a = length_a - is_last_special_a.long()
-        eff_len_b = length_b - is_last_special_b.long()
         # Ensure we always keep at least [CLS] plus one token in range computations
         eff_len_a = eff_len_a.clamp(min=2)
         eff_len_b = eff_len_b.clamp(min=2)

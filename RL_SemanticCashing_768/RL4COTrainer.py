@@ -464,6 +464,13 @@ if __name__ == '__main__':
         action="store_true",
         help="If set, checkpoints will store weights only (smaller, faster to save).",
     )
+    parser.add_argument(
+        "--policy_mode",
+        type=str,
+        default="separate",
+        choices=["joint", "separate"],
+        help="Policy architecture mode: 'joint' uses A<->B cross-attention; 'separate' runs phi(x) and phi(y) independently (shared weights) then interleaves actions.",
+    )
     args = parser.parse_args()
     print(f"[ARGS] train_file={args.train_file}")
     print(f"[ARGS] train_pairs_json={args.train_pairs_json}")
@@ -477,6 +484,7 @@ if __name__ == '__main__':
     print(f"[ARGS] debug_policy={args.debug_policy}")
     print(f"[ARGS] debug_policy_log_path={args.debug_policy_log_path}")
     print(f"[ARGS] debug_policy_every_n_epochs={args.debug_policy_every_n_epochs}")
+    print(f"[ARGS] policy_mode={args.policy_mode}")
     
     # Verify HF_ENDPOINT is set correctly
     hf_endpoint = os.environ.get('HF_ENDPOINT', 'Not set')
@@ -567,7 +575,13 @@ if __name__ == '__main__':
     test_env = MaxSimEnv(generator=test_generator, max_segments=MAX_SEGMENTS, embedding_model=embedding_model, device=device)
 
   
-    policy = AdaptedPointerNetworkPolicy(train_env, embedding_dim=768, hidden_dim=768, max_segments=MAX_SEGMENTS)
+    policy = AdaptedPointerNetworkPolicy(
+        train_env,
+        embedding_dim=768,
+        hidden_dim=768,
+        max_segments=MAX_SEGMENTS,
+        policy_mode=str(args.policy_mode),
+    )
     print("Components instantiated.")
 
 

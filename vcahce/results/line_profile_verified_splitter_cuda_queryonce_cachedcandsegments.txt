@@ -1,0 +1,1276 @@
+args={'dataset': 'vCache/SemBenchmarkClassification', 'llm_col': 'response_llama_3_8b', 'splitter_checkpoint': '/data2/ali/checkpoints_words', 'splitter_device': 'cuda', 'delta': 0.02, 'candidate_k': 1, 'use_cached_candidate_segments': True, 'max_samples': 30, 'warmup_samples': 3, 'profile_samples': 10, 'sleep': 0.0, 'hf_cache_base': '/data2/ali/hf', 'output': 'results/line_profile_verified_splitter_cuda_queryonce_cachedcandsegments.txt'}
+python=3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]
+cwd=/home/ali/vcahce
+
+candidate_encode_total_s=0.0
+candidate_encode_calls=0
+candidate_encode_avg_ms=0.000
+candidate_encode_ms_per_profile_sample=0.000
+
+Timer unit: 0.001 s
+
+Total time: 0.366814 s
+File: /home/ali/vcahce/benchmarks/line_profile_verified_splitter.py
+Function: main.<locals>.<lambda> at line 266
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   266         2        366.8    183.4    100.0          lambda: _run_loop(
+   267         1          0.0      0.0      0.0              vcache=vcache,
+   268         1          0.0      0.0      0.0              rows=rows_list[int(args.warmup_samples) :],
+   269         1          0.0      0.0      0.0              llm_col=args.llm_col,
+   270         1          0.0      0.0      0.0              profile_samples=int(args.profile_samples),
+   271         1          0.0      0.0      0.0              sleep_s=float(args.sleep),
+   272                                                   )
+
+Total time: 0.366405 s
+File: /home/ali/vcahce/vcache/main.py
+Function: VCache.infer_with_cache_info at line 53
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    53                                               def infer_with_cache_info(
+    54                                                   self,
+    55                                                   prompt: str,
+    56                                                   system_prompt: Optional[str] = None,
+    57                                                   id_set: int = -1,
+    58                                               ) -> Tuple[bool, str, EmbeddingMetadataObj, EmbeddingMetadataObj]:
+    59                                                   """Infers a response and returns the cache hit status and metadata.
+    60                                           
+    61                                                   Args:
+    62                                                       prompt (str): The prompt to create a response for.
+    63                                                       system_prompt (Optional[str]): The optional system prompt to use
+    64                                                           for the response. Overrides the system prompt in the
+    65                                                           VCacheConfig if provided.
+    66                                                       id_set (int): The set identifier for the embedding. This is used in the
+    67                                                           benchmark to identify if the nearest neighbor is from the same set
+    68                                                           (if the cached response is correct or incorrect).
+    69                                           
+    70                                                   Returns:
+    71                                                       Tuple[bool, str, EmbeddingMetadataObj, EmbeddingMetadataObj]: A tuple containing the cache
+    72                                                           hit status, the response, the metadata of the response and nearest neighbor metadata.
+    73                                                   """
+    74        10          0.0      0.0      0.0          if system_prompt is None:
+    75                                                       system_prompt = self.vcache_config.system_prompt
+    76                                           
+    77        10          0.0      0.0      0.0          if self.vcache_config.eviction_policy.is_evicting():
+    78                                                       response = self.__generate_response(prompt, system_prompt)
+    79                                                       return (
+    80                                                           False,
+    81                                                           response,
+    82                                                           EmbeddingMetadataObj(embedding_id=-1, response=response, id_set=id_set),
+    83                                                           EmbeddingMetadataObj(embedding_id=-1, response=response, id_set=id_set),
+    84                                                       )
+    85                                           
+    86        20        358.8     17.9     97.9          is_cache_hit, response, nn_metadata = self.vcache_policy.process_request(
+    87        10          0.0      0.0      0.0              prompt, system_prompt, id_set
+    88                                                   )
+    89                                           
+    90        10          0.0      0.0      0.0          if nn_metadata is not None:
+    91        10          0.0      0.0      0.0              self.vcache_config.eviction_policy.update_eviction_metadata(nn_metadata)
+    92                                           
+    93        10          0.0      0.0      0.0          nn_metadata_copy: Optional[EmbeddingMetadataObj] = (
+    94        10          7.2      0.7      2.0              copy.deepcopy(nn_metadata) if nn_metadata is not None else None
+    95                                                   )
+    96                                           
+    97        10          0.0      0.0      0.0          if self.vcache_config.eviction_policy.ready_to_evict(self.vcache_policy.cache):
+    98                                                       self.vcache_config.eviction_policy.evict(self.vcache_policy.cache)
+    99                                           
+   100        10          0.0      0.0      0.0          if is_cache_hit:
+   101                                                       return is_cache_hit, response, nn_metadata_copy, nn_metadata_copy
+   102                                                   else:
+   103        10          0.0      0.0      0.0              return (
+   104        10          0.0      0.0      0.0                  is_cache_hit,
+   105        10          0.0      0.0      0.0                  response,
+   106        10          0.2      0.0      0.1                  EmbeddingMetadataObj(embedding_id=-1, response=response, id_set=id_set),
+   107        10          0.0      0.0      0.0                  nn_metadata_copy,
+   108                                                       )
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/cache/cache.py
+Function: Cache.get_knn at line 65
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    65                                               def get_knn(self, prompt: str, k: int) -> List[tuple[float, int]]:
+    66                                                   """Gets k-nearest neighbors for a given prompt.
+    67                                           
+    68                                                   Args:
+    69                                                       prompt (str): The prompt to get the k-nearest neighbors for.
+    70                                                       k (int): The number of nearest neighbors to retrieve.
+    71                                           
+    72                                                   Returns:
+    73                                                       List[tuple[float, int]]: A list of tuples, each containing a
+    74                                                       similarity score and an embedding ID.
+    75                                                   """
+    76                                                   embedding = self.embedding_engine.get_embedding(prompt)
+    77                                                   return self.embedding_store.get_knn(embedding, k)
+
+Total time: 0.00180963 s
+File: /home/ali/vcahce/vcache/vcache_core/cache/cache.py
+Function: Cache.get_knn_from_embedding at line 79
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    79                                               def get_knn_from_embedding(self, embedding, k: int) -> List[tuple[float, int]]:
+    80                                                   """
+    81                                                   Gets k-nearest neighbors for a precomputed embedding.
+    82                                           
+    83                                                   This bypasses `embedding_engine.get_embedding(prompt)` and is useful when the caller
+    84                                                   already computed the embedding (e.g., from a shared LM forward used elsewhere).
+    85                                           
+    86                                                   Args:
+    87                                                       embedding: embedding vector (list/np.ndarray/torch tensor convertible to list[float]).
+    88                                                       k (int): number of nearest neighbors.
+    89                                                   """
+    90        10          0.0      0.0      0.3          try:
+    91                                                       # torch.Tensor -> list[float]
+    92        10          0.0      0.0      1.3              if hasattr(embedding, "detach"):
+    93                                                           embedding = embedding.detach().cpu().tolist()
+    94        10          0.0      0.0      0.6              elif hasattr(embedding, "tolist"):
+    95                                                           embedding = embedding.tolist()
+    96                                                   except Exception:
+    97                                                       pass
+    98        10          1.8      0.2     97.8          return self.embedding_store.get_knn(embedding, k)
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/cache/embedding_engine/strategies/bge.py
+Function: BGEEmbeddingEngine.get_embedding at line 16
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    16                                               @override
+    17                                               def get_embedding(self, text: str) -> List[float]:
+    18                                                   """
+    19                                                   Get the embedding for the given text using the underlying BGE model.
+    20                                           
+    21                                                   Args:
+    22                                                       text: The text to get the embedding for.
+    23                                           
+    24                                                   Returns:
+    25                                                       The embedding of the text as a list of floats.
+    26                                                   """
+    27                                                   # EmbeddingModel.get_embedding returns a numpy array, we convert to list
+    28                                                   embedding = self.embedding_model.get_embedding(text)
+    29                                                   return embedding.tolist()
+
+Total time: 0.00163524 s
+File: /home/ali/vcahce/vcache/vcache_core/cache/embedding_store/vector_db/strategies/hnsw_lib.py
+Function: HNSWLibVectorDB.get_knn at line 80
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    80                                               def get_knn(self, embedding: List[float], k: int) -> List[tuple[float, int]]:
+    81                                                   """Gets k-nearest neighbors for a given embedding.
+    82                                           
+    83                                                   Args:
+    84                                                       embedding (List[float]): The query embedding vector.
+    85                                                       k (int): The number of nearest neighbors to return.
+    86                                           
+    87                                                   Returns:
+    88                                                       List[tuple[float, int]]: A list of tuples containing similarity
+    89                                                       scores and embedding IDs.
+    90                                                   """
+    91        10          0.0      0.0      0.9          if self.index is None:
+    92                                                       return []
+    93        10          0.0      0.0      1.3          k_ = min(k, self.embedding_count)
+    94        10          0.0      0.0      0.5          if k_ == 0:
+    95                                                       return []
+    96        10          0.9      0.1     57.8          ids, similarities = self.index.knn_query(embedding, k=k_)
+    97        10          0.1      0.0      4.5          metric_type = self.similarity_metric_type.value
+    98        20          0.4      0.0     27.4          similarity_scores = [
+    99        10          0.0      0.0      1.8              self.transform_similarity_score(sim, metric_type) for sim in similarities[0]
+   100                                                   ]
+   101        10          0.1      0.0      3.7          id_list = [int(id) for id in ids[0]]
+   102        10          0.0      0.0      2.2          return list(zip(similarity_scores, id_list))
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/AdaptedPointerNetworkPolicy.py
+Function: CrossAttentionBlock.forward at line 27
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    27                                               def forward(
+    28                                                   self,
+    29                                                   emb_a: torch.Tensor,
+    30                                                   emb_b: torch.Tensor,
+    31                                                   pad_mask_a: torch.Tensor | None = None,
+    32                                                   pad_mask_b: torch.Tensor | None = None,
+    33                                               ) -> tuple[torch.Tensor, torch.Tensor]:
+    34                                                   # A attends to B
+    35                                                   attn_a, _ = self.mha_ab(query=emb_a, key=emb_b, value=emb_b, key_padding_mask=pad_mask_b)
+    36                                                   a_out = self.norm_ab(emb_a + attn_a)
+    37                                                   a_out = self.norm_ab(a_out + self.ff_ab(a_out))
+    38                                           
+    39                                                   # B attends to A
+    40                                                   attn_b, _ = self.mha_ba(query=emb_b, key=emb_a, value=emb_a, key_padding_mask=pad_mask_a)
+    41                                                   b_out = self.norm_ba(emb_b + attn_b)
+    42                                                   b_out = self.norm_ba(b_out + self.ff_ba(b_out))
+    43                                           
+    44                                                   return a_out, b_out
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/AdaptedPointerNetworkPolicy.py
+Function: AdaptedPointerNetworkPolicy.forward at line 179
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   179                                               def forward(self, td, env=None, phase: str = "train", select_best: bool = False, **kwargs):
+   180                                                   """与 RL4CO 的 REINFORCE 调用约定兼容的入口。
+   181                                                   根据阶段/标志选择采样或贪心解码，返回包含 reward 与 log_likelihood 的字典。
+   182                                                   """
+   183                                                   # In inference paths (e.g., MaxSimSplitter), we only need `actions`.
+   184                                                   # Reward computation can be expensive and is not used by the splitter.
+   185                                                   compute_reward: bool = bool(kwargs.pop("compute_reward", True))
+   186                                                  
+   187                                                   decode_override = kwargs.pop("decode_type", None)
+   188                                                   if decode_override is not None:
+   189                                                       decode_type = decode_override
+   190                                                   else:
+   191                                                       decode_type = "greedy" if (select_best or phase != "train") else "sampling"
+   192                                           
+   193                                                   actions, log_likelihood, info = self._forward(td, decode_type=decode_type, **kwargs)
+   194                                                   reward = None
+   195                                                   if compute_reward:
+   196                                                       # 计算奖励
+   197                                                       used_env = env if env is not None else getattr(self, "env", None)
+   198                                                       if used_env is None:
+   199                                                           raise RuntimeError("Environment instance is required to compute reward.")
+   200                                                       reward = used_env.get_reward(td, actions)
+   201                                                   else:
+   202                                                       # Cheap placeholder (keeps output schema stable)
+   203                                                       try:
+   204                                                           reward = actions.new_zeros((actions.shape[0],), dtype=torch.float32)
+   205                                                       except Exception:
+   206                                                           reward = torch.zeros(1, dtype=torch.float32, device=self.device)
+   207                                           
+   208                                                   return {
+   209                                                       "actions": actions,
+   210                                                       "log_likelihood": log_likelihood,
+   211                                                       "reward": reward,
+   212                                                       "info": info,
+   213                                                   }
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/AdaptedPointerNetworkPolicy.py
+Function: AdaptedPointerNetworkPolicy._forward at line 383
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   383                                               def _forward(self, td, decode_type="sampling", **kwargs):
+   384                                                   """
+   385                                                   实现自回归解码的核心逻辑 。
+   386                                                   """
+   387                                                   # Ignore legacy debug flag if provided (no-op)
+   388                                                   kwargs.pop("debug", None)
+   389                                                  
+   390                                                
+   391                                                   target_device = next(self.lm.parameters()).device
+   392                                                   if getattr(self, "_current_module_device", None) != target_device:
+   393                                                       self.to(target_device)
+   394                                                       self._current_module_device = target_device
+   395                                                   self._device = target_device
+   396                                                   
+   397                                              
+   398                                                   try:
+   399                                                       td = td.to(target_device)
+   400                                                   except Exception:
+   401                                                       for k in ['token_embeddings_a','token_embeddings_b','attention_mask_a','attention_mask_b',
+   402                                                                 'input_ids_a','input_ids_b','length_a','length_b']:
+   403                                                           if k in td and isinstance(td[k], torch.Tensor):
+   404                                                               td[k] = td[k].to(target_device)
+   405                                                   self._init_punctuation_ids(td['input_ids_a'].device)
+   406                                                   
+   407                                                
+   408                                                   input_dim = td['token_embeddings_a'].size(-1)
+   409                                                   if self.input_proj is None:
+   410                                                       with torch.inference_mode(False):
+   411                                                           if input_dim == self.hidden_dim:
+   412                                                               self.input_proj = nn.Identity()
+   413                                                           else:
+   414                                                               self.input_proj = nn.Linear(input_dim, self.hidden_dim)
+   415                                                       self.input_proj.to(self.device)
+   416                                           
+   417                                                   embedded_a = self.input_proj(td['token_embeddings_a'])
+   418                                                   embedded_b = self.input_proj(td['token_embeddings_b'])
+   419                                                   
+   420                                                   mask_a = ~td['attention_mask_a'].bool()
+   421                                                   mask_b = ~td['attention_mask_b'].bool()
+   422                                                   
+   423                                                   batch_size = embedded_a.size(0)
+   424                                                   seq_len_a = embedded_a.size(1)
+   425                                                   seq_len_b = embedded_b.size(1)
+   426                                                   
+   427                                                   # --- 2. Encoder (Cross-Attention) ---
+   428                                                   for layer in self.encoder_layers:
+   429                                                       embedded_a, embedded_b = layer(
+   430                                                           emb_a=embedded_a, 
+   431                                                           emb_b=embedded_b, 
+   432                                                           pad_mask_a=mask_a, 
+   433                                                           pad_mask_b=mask_b
+   434                                                       )
+   435                                                   encoder_outputs_a = embedded_a
+   436                                                   encoder_outputs_b = embedded_b
+   437                                                   
+   438                                                   # --- 3. Decoder 初始化 ---
+   439                                                   decoder_input = self.decoder_start_input.unsqueeze(0).repeat(batch_size, 1)
+   440                                                   h, c = (torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device),
+   441                                                           torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device))
+   442                                                   
+   443                                                   pointers = []
+   444                                                   log_probs = []
+   445                                                   
+   446                                                   # 初始边界设为 0 (对应 [CLS])
+   447                                                   current_bA = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+   448                                                   current_bB = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+   449                                           
+   450                                                   # Precompute base punctuation mask (special end tokens are handled per-step)
+   451                                                   is_punct_base_a = torch.isin(td["input_ids_a"], self._valid_split_ids)
+   452                                                   is_punct_base_b = torch.isin(td["input_ids_b"], self._valid_split_ids)
+   453                                           
+   454                                                   # --- 4. 解码循环 ---
+   455                                                   for step in range(self.max_segments):
+   456                                                       # (a) LSTM Step
+   457                                                       h, c = self.decoder_cell(decoder_input, (h, c))
+   458                                                       query_vec = self.attention_linear_decoder(h)
+   459                                           
+   460                                                       # Allow [SEP]/[EOS] only on the final step to prevent early degeneration.
+   461                                                       if step == self.max_segments - 1 and getattr(self, "_end_split_ids", None) is not None:
+   462                                                           is_end_a = torch.isin(td["input_ids_a"], self._end_split_ids)
+   463                                                           is_end_b = torch.isin(td["input_ids_b"], self._end_split_ids)
+   464                                                           is_punct_global_a = is_punct_base_a | is_end_a
+   465                                                           is_punct_global_b = is_punct_base_b | is_end_b
+   466                                                       else:
+   467                                                           is_punct_global_a = is_punct_base_a
+   468                                                           is_punct_global_b = is_punct_base_b
+   469                                           
+   470                                                       #  指针 A 选择
+   471                                                       range_a = torch.arange(seq_len_a, device=self.device).expand(batch_size, -1)
+   472                                                       
+   473                                                       # 1. 必须是标点符号 (预计算结果)
+   474                                                       # 2. 必须严格在当前边界之后 (range_a > current_bA)
+   475                                                       # 3. 必须在有效长度内 (range_a < length_a)
+   476                                                  
+   477                                                       
+   478                                                       is_future_a = range_a > current_bA.unsqueeze(1)
+   479                                                       is_in_length_a = range_a < td['length_a'].unsqueeze(1)
+   480                                                       valid_slots_a = is_punct_global_a & is_future_a & is_in_length_a
+   481                                                       mask_ptr_a = ~valid_slots_a
+   482                                           
+   483                                                       inp_a = query_vec.unsqueeze(2)
+   484                                                       ctx_a = self.attention_linear_encoder(encoder_outputs_a.permute(0, 2, 1))
+   485                                                       V_exp = self.V.unsqueeze(0).expand(batch_size, -1).unsqueeze(1)
+   486                                                       attn_scores_a = torch.bmm(V_exp, torch.tanh(inp_a + ctx_a)).squeeze(1)
+   487                                                       
+   488                                                  
+   489                                                       mask_fill_val = float('-inf') 
+   490                                                       attn_scores_a = attn_scores_a.masked_fill(mask_ptr_a, mask_fill_val)
+   491                                           
+   492                                                       # === 指针 B 选择 ===
+   493                                                       range_b = torch.arange(seq_len_b, device=self.device).expand(batch_size, -1)
+   494                                                       
+   495                                                       is_future_b = range_b > current_bB.unsqueeze(1)
+   496                                                       is_in_length_b = range_b < td['length_b'].unsqueeze(1)
+   497                                                       
+   498                                                       valid_slots_b = is_punct_global_b & is_future_b & is_in_length_b
+   499                                                       mask_ptr_b = ~valid_slots_b
+   500                                           
+   501                                                       inp_b = query_vec.unsqueeze(2)
+   502                                                       ctx_b = self.attention_linear_encoder(encoder_outputs_b.permute(0, 2, 1))
+   503                                                       attn_scores_b = torch.bmm(V_exp, torch.tanh(inp_b + ctx_b)).squeeze(1)
+   504                                                       attn_scores_b = attn_scores_b.masked_fill(mask_ptr_b, mask_fill_val)
+   505                                           
+   506                                                       # === 采样/Argmax ===
+   507                                                       pointer_a = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+   508                                                       pointer_b = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+   509                                                       logp_a = torch.zeros(batch_size, device=self.device)
+   510                                                       logp_b = torch.zeros(batch_size, device=self.device)
+   511                                           
+   512                                                       has_valid_a = valid_slots_a.any(dim=1)
+   513                                                       has_valid_b = valid_slots_b.any(dim=1)
+   514                                           
+   515                                                       # 处理 A
+   516                                                       if has_valid_a.any():
+   517                                                           rows = has_valid_a
+   518                                                           if decode_type == "sampling":
+   519                                                               dist = Categorical(logits=attn_scores_a[rows])
+   520                                                               act = dist.sample()
+   521                                                               pointer_a[rows] = act
+   522                                                               logp_a[rows] = dist.log_prob(act)
+   523                                                           else:
+   524                                                               pointer_a[rows] = torch.argmax(attn_scores_a[rows], dim=1)
+   525                                           
+   526                                                       if (~has_valid_a).any():
+   527                                                           rows = ~has_valid_a
+   528                                                         
+   529                                                           pointer_a[rows] = td['length_a'][rows] - 1
+   530                                                        
+   531                                           
+   532                                                       # 处理 B
+   533                                                       if has_valid_b.any():
+   534                                                           rows = has_valid_b
+   535                                                           if decode_type == "sampling":
+   536                                                               dist = Categorical(logits=attn_scores_b[rows])
+   537                                                               act = dist.sample()
+   538                                                               pointer_b[rows] = act
+   539                                                               logp_b[rows] = dist.log_prob(act)
+   540                                                           else:
+   541                                                               pointer_b[rows] = torch.argmax(attn_scores_b[rows], dim=1)
+   542                                                       
+   543                                                       if (~has_valid_b).any():
+   544                                                           rows = ~has_valid_b
+   545                                                           pointer_b[rows] = td['length_b'][rows] - 1
+   546                                           
+   547                                                       pointers.append(torch.stack([pointer_a, pointer_b], dim=1))
+   548                                                       log_probs.append(logp_a + logp_b)
+   549                                           
+   550                                                       # ---------------------------------------------------------------------
+   551                                                       # Fast feedback embedding: reuse token-level embeddings already computed
+   552                                                       # outside the RL loop (MaxSimSplitter.split_pair_return_segments does one
+   553                                                       # LM forward per text). We slice the span corresponding to the chosen
+   554                                                       # boundary and mean-pool it, matching MaxSimEnv's "FAST VERSION":
+   555                                                       #   real_start = (prev + 1) if prev > 0 else 1   # skip [CLS] at index 0
+   556                                                       #   end        = pointer + 1                    # inclusive boundary token
+   557                                                       # ---------------------------------------------------------------------
+   558                                                       token_emb_a = td["token_embeddings_a"]  # [B, L, H] on self.device already
+   559                                                       length_a = td["length_a"].long()  # [B]
+   560                                           
+   561                                                       feedback_emb_a_list = []
+   562                                                       for b in range(batch_size):
+   563                                                           s_a = int(current_bA[b].item())
+   564                                                           e_a = int(pointer_a[b].item())
+   565                                                           la = int(length_a[b].item())
+   566                                                           la = max(1, la)
+   567                                           
+   568                                                           # Policy semantics: skip [CLS] (idx 0), boundary token is inclusive.
+   569                                                           real_start_a = (s_a + 1) if s_a > 0 else 1
+   570                                                           real_end_a = e_a + 1
+   571                                           
+   572                                                           # Clip to effective length to avoid pooling padded tail.
+   573                                                           real_start_a = min(max(0, real_start_a), la)
+   574                                                           real_end_a = min(max(0, real_end_a), la)
+   575                                           
+   576                                                           if real_end_a <= real_start_a:
+   577                                                               # Match previous behavior: empty segment -> zeros embedding.
+   578                                                               emb_val = torch.zeros(
+   579                                                                   token_emb_a.size(-1), device=token_emb_a.device, dtype=token_emb_a.dtype
+   580                                                               )
+   581                                                           else:
+   582                                                               emb_val = token_emb_a[b, real_start_a:real_end_a, :].mean(dim=0)
+   583                                           
+   584                                                           feedback_emb_a_list.append(emb_val)
+   585                                           
+   586                                                       feedback_tensor_a = torch.stack(feedback_emb_a_list, dim=0)  # [B, H]
+   587                                                       
+   588                                                       # 投影作为 LSTM 下一步输入
+   589                                                       decoder_input = self.input_proj(feedback_tensor_a)
+   590                                           
+   591                                                       # 更新状态
+   592                                                       current_bA = pointer_a
+   593                                                       current_bB = pointer_b
+   594                                           
+   595                                                
+   596                                                   actions = torch.stack(pointers, 1).view(batch_size, -1)
+   597                                                   log_likelihood = torch.stack(log_probs, 1).sum(dim=1)
+   598                                           
+   599                                                   info = {}
+   600                                           
+   601                                                   return actions, log_likelihood, info
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/MaxSimEnv.py
+Function: MaxSimEnv.raw_score_text at line 258
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   258                                               def raw_score_text(self,
+   259                                                                query_tensor: torch.Tensor,
+   260                                                                sub_corpus_embeddings: torch.Tensor,
+   261                                                                query_weights: torch.Tensor,
+   262                                                                corpus_weights: torch.Tensor,
+   263                                                                times: int = 0) -> torch.Tensor:
+   264                                                   """
+   265                                                   计算query和corpus之间基于粗粒度和细粒度嵌入的加权相似度分数。
+   266                                                   """
+   267                                                  
+   268                                                   weights = F.softmax(self.score_weights_raw, dim=0)
+   269                                                   w_coarse = weights[0]
+   270                                                   w_fine_row = weights[1]
+   271                                                   w_fine_col = weights[2]
+   272                                           
+   273                                                   query_full_vec = query_tensor[-1:, :]
+   274                                                   corpus_full_vec = sub_corpus_embeddings[-1:, :]
+   275                                                   coarse_grained_score = F.cosine_similarity(query_full_vec, corpus_full_vec).squeeze()
+   276                                           
+   277                                                   query_sentence_vecs = query_tensor[:-1, :]
+   278                                                   corpus_sentence_vecs = sub_corpus_embeddings[:-1, :]
+   279                                           
+   280                                                   if query_sentence_vecs.shape[0] > 0 and corpus_sentence_vecs.shape[0] > 0:
+   281                                                       query_norm = F.normalize(query_sentence_vecs, p=2, dim=-1)
+   282                                                       corpus_norm = F.normalize(corpus_sentence_vecs, p=2, dim=-1)
+   283                                                       cos_sim_matrix = torch.mm(query_norm, corpus_norm.T)
+   284                                           
+   285                                                       max_cos_sim_row = torch.max(cos_sim_matrix, dim=1).values
+   286                                                       fine_grained_row_score = torch.sum(max_cos_sim_row * query_weights) / (torch.sum(query_weights) + 1e-8)
+   287                                           
+   288                                                       max_cos_sim_col = torch.max(cos_sim_matrix, dim=0).values
+   289                                                       fine_grained_col_score = torch.sum(max_cos_sim_col * corpus_weights) / (torch.sum(corpus_weights) + 1e-8)
+   290                                                   else:
+   291                                                       fine_grained_row_score = torch.tensor(0.0, device=self.device)
+   292                                                       fine_grained_col_score = torch.tensor(0.0, device=self.device)
+   293                                           
+   294                                                 
+   295                                                   final_score = (w_coarse * coarse_grained_score +
+   296                                                                  w_fine_row * fine_grained_row_score +
+   297                                                                  w_fine_col * fine_grained_col_score)
+   298                                           
+   299                                                   return final_score
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/MaxSimEnv.py
+Function: MaxSimEnv._get_reward at line 301
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   301                                               def _get_reward(self, td: TensorDict, actions) -> torch.Tensor:
+   302                                                   batch_size = actions.shape[0]
+   303                                                   lm = self.reward_lm.model
+   304                                                   tok = self.reward_lm.tokenizer
+   305                                                   lm_device = next(lm.parameters()).device
+   306                                                   rewards = torch.zeros(batch_size, device=lm_device)
+   307                                           
+   308                                                   input_ids_a = td["input_ids_a"]
+   309                                                   input_ids_b = td["input_ids_b"]
+   310                                                   length_a = td["length_a"].long()
+   311                                                   length_b = td["length_b"].long()
+   312                                           
+   313                                                   # Normalize actions -> pa_tensor/pb_tensor of shape [batch, max_segments]
+   314                                                   if isinstance(actions, torch.Tensor) and actions.dim() == 3 and actions.size(-1) == 2:
+   315                                                       # shape [batch, K, 2] where last dim is [A, B]
+   316                                                       pa_tensor = actions[:, :, 0]
+   317                                                       pb_tensor = actions[:, :, 1]
+   318                                                   elif isinstance(actions, torch.Tensor) and actions.dim() == 2:
+   319                                                       # shape [batch, 2*K] expected; policy currently outputs interleaved [A0,B0,A1,B1,...]
+   320                                                       if actions.size(1) != 2 * self.max_segments:
+   321                                                           raise ValueError(
+   322                                                               f"Unsupported actions shape for reward: {actions.shape}. "
+   323                                                               f"Expected second dim = {2*self.max_segments} (2*max_segments)."
+   324                                                           )
+   325                                                       pa_tensor = actions[:, 0::2]  # [A0, A1, ...]
+   326                                                       pb_tensor = actions[:, 1::2]  # [B0, B1, ...]
+   327                                                   else:
+   328                                                       raise ValueError(
+   329                                                           f"Unsupported actions shape for reward: {getattr(actions, 'shape', None)}. "
+   330                                                           f"Expected [batch, {2*self.max_segments}] or [batch, {self.max_segments}, 2]."
+   331                                                       )
+   332                                           
+   333                                                   for i in range(batch_size):
+   334                                                       pa = pa_tensor[i].tolist()
+   335                                                       pb = pb_tensor[i].tolist()
+   336                                           
+   337                                                       la = int(length_a[i].item())
+   338                                                       lb = int(length_b[i].item())
+   339                                                       la = max(1, la)
+   340                                                       lb = max(1, lb)
+   341                                           
+   342                                                       pa = [min(max(0, p), la - 1) for p in pa]
+   343                                                       pb = [min(max(0, p), lb - 1) for p in pb]
+   344                                           
+   345                                                       # NOTE: Align segmentation semantics with the policy.
+   346                                                       # Policy treats pointers as "end boundary tokens" and skips [CLS] (index 0) when building segments:
+   347                                                       #   real_start = prev_boundary + 1 (but starts from 1 when prev_boundary==0)
+   348                                                       #   real_end   = pointer + 1      (inclusive of the boundary token)
+   349                                                       bounds_a = sorted(set(pa))
+   350                                                       bounds_b = sorted(set(pb))
+   351                                           
+   352                                                       # ===== ORIGINAL HEAVY LM FORWARD (保留为注释，作为兜底参考) =====
+   353                                                       # seg_ids_a = []
+   354                                                       # start = 0
+   355                                                       # for p in bounds_a:
+   356                                                       #     end = p + 1
+   357                                                       #     if end > start:
+   358                                                       #         seg_ids_a.append(input_ids_a[i, start:end])
+   359                                                       #     start = end
+   360                                                       # if start < la:
+   361                                                       #     seg_ids_a.append(input_ids_a[i, start:la])
+   362                                                       #
+   363                                                       # seg_ids_b = []
+   364                                                       # start = 0
+   365                                                       # for p in bounds_b:
+   366                                                       #     end = p + 1
+   367                                                       #     if end > start:
+   368                                                       #         seg_ids_b.append(input_ids_b[i, start:end])
+   369                                                       #     start = end
+   370                                                       # if start < lb:
+   371                                                       #     seg_ids_b.append(input_ids_b[i, start:lb])
+   372                                                       #
+   373                                                       # if len(seg_ids_a) == 0 or len(seg_ids_b) == 0:
+   374                                                       #     rewards[i] = 0.0
+   375                                                       #     continue
+   376                                                       #
+   377                                                       # with torch.no_grad():
+   378                                                       #     seg_emb_a_list = []
+   379                                                       #     for s in seg_ids_a:
+   380                                                       #         ids = s.unsqueeze(0).to(lm_device)
+   381                                                       #         attn = torch.ones_like(ids, device=lm_device)
+   382                                                       #         out = lm(ids, attention_mask=attn).last_hidden_state.mean(dim=1)
+   383                                                       #         seg_emb_a_list.append(out.squeeze(0))
+   384                                                       #     sentence_embeds_a = torch.stack(seg_emb_a_list, dim=0)
+   385                                                       #
+   386                                                       #     seg_emb_b_list = []
+   387                                                       #     for s in seg_ids_b:
+   388                                                       #         ids = s.unsqueeze(0).to(lm_device)
+   389                                                       #         attn = torch.ones_like(ids, device=lm_device)
+   390                                                       #         out = lm(ids, attention_mask=attn).last_hidden_state.mean(dim=1)
+   391                                                       #         seg_emb_b_list.append(out.squeeze(0))
+   392                                                       #     sentence_embeds_b = torch.stack(seg_emb_b_list, dim=0)
+   393                                                       #
+   394                                                       #     full_ids_a = input_ids_a[i, :la].unsqueeze(0).to(lm_device)
+   395                                                       #     full_attn_a = (full_ids_a != tok.pad_token_id).long()
+   396                                                       #     full_embed_a = lm(full_ids_a, attention_mask=full_attn_a).last_hidden_state.mean(dim=1)
+   397                                                       #
+   398                                                       #     full_ids_b = input_ids_b[i, :lb].unsqueeze(0).to(lm_device)
+   399                                                       #     full_attn_b = (full_ids_b != tok.pad_token_id).long()
+   400                                                       #     full_embed_b = lm(full_ids_b, attention_mask=full_attn_b).last_hidden_state.mean(dim=1)
+   401                                                       #
+   402                                                       #     if sentence_embeds_a.shape[0] > 0:
+   403                                                       #         query_tensor = torch.cat([sentence_embeds_a, full_embed_a], dim=0)
+   404                                                       #     else:
+   405                                                       #         query_tensor = full_embed_a
+   406                                                       #
+   407                                                       #     if sentence_embeds_b.shape[0] > 0:
+   408                                                       #         corpus_tensor = torch.cat([sentence_embeds_b, full_embed_b], dim=0)
+   409                                                       #     else:
+   410                                                       #         corpus_tensor = full_embed_b
+   411                                                       # ============================================================
+   412                                           
+   413                                                       # FAST VERSION：直接复用 token 级嵌入做均值池化
+   414                                                       with torch.no_grad():
+   415                                                           token_emb_a = td["token_embeddings_a"][i, :la].to(lm_device)
+   416                                                           token_emb_b = td["token_embeddings_b"][i, :lb].to(lm_device)
+   417                                           
+   418                                                           seg_emb_a_list = []
+   419                                                           prev = 0
+   420                                                           for p in bounds_a:
+   421                                                               end = p + 1
+   422                                                               real_start = (prev + 1) if prev > 0 else 1  # skip [CLS]
+   423                                                               if end > real_start:
+   424                                                                   seg_emb_a_list.append(token_emb_a[real_start:end].mean(dim=0))
+   425                                                               prev = p
+   426                                                           # Tail segment after last boundary
+   427                                                           tail_start = (prev + 1) if prev > 0 else 1
+   428                                                           if tail_start < la:
+   429                                                               seg_emb_a_list.append(token_emb_a[tail_start:la].mean(dim=0))
+   430                                                           if len(seg_emb_a_list) == 0:
+   431                                                               rewards[i] = 0.0
+   432                                                               continue
+   433                                                           sentence_embeds_a = torch.stack(seg_emb_a_list, dim=0)
+   434                                           
+   435                                                           seg_emb_b_list = []
+   436                                                           prev = 0
+   437                                                           for p in bounds_b:
+   438                                                               end = p + 1
+   439                                                               real_start = (prev + 1) if prev > 0 else 1  # skip [CLS]
+   440                                                               if end > real_start:
+   441                                                                   seg_emb_b_list.append(token_emb_b[real_start:end].mean(dim=0))
+   442                                                               prev = p
+   443                                                           tail_start = (prev + 1) if prev > 0 else 1
+   444                                                           if tail_start < lb:
+   445                                                               seg_emb_b_list.append(token_emb_b[tail_start:lb].mean(dim=0))
+   446                                                           if len(seg_emb_b_list) == 0:
+   447                                                               rewards[i] = 0.0
+   448                                                               continue
+   449                                                           sentence_embeds_b = torch.stack(seg_emb_b_list, dim=0)
+   450                                           
+   451                                                           full_embed_a = token_emb_a.mean(dim=0, keepdim=True)
+   452                                                           full_embed_b = token_emb_b.mean(dim=0, keepdim=True)
+   453                                           
+   454                                                           if sentence_embeds_a.shape[0] > 0:
+   455                                                               query_tensor = torch.cat([sentence_embeds_a, full_embed_a], dim=0)
+   456                                                           else:
+   457                                                               query_tensor = full_embed_a
+   458                                           
+   459                                                           if sentence_embeds_b.shape[0] > 0:
+   460                                                               corpus_tensor = torch.cat([sentence_embeds_b, full_embed_b], dim=0)
+   461                                                           else:
+   462                                                               corpus_tensor = full_embed_b
+   463                                           
+   464                                                           query_weights = torch.ones(sentence_embeds_a.shape[0], device=query_tensor.device)
+   465                                                           corpus_weights = torch.ones(sentence_embeds_b.shape[0], device=corpus_tensor.device)
+   466                                           
+   467                                                           rewards[i] = self.raw_score_text(
+   468                                                               query_tensor, corpus_tensor, query_weights, corpus_weights, times=0
+   469                                                           ).to(rewards.device)
+   470                                           
+   471                                                   return rewards
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/MaxSimSplitter.py
+Function: MaxSimSplitter.split_pair_return_segments at line 175
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   175                                               def split_pair_return_segments(self, text_a, text_b):
+   176                                                   """
+   177                                                   输入：Query 和 Cache Candidate
+   178                                                   输出：RL模型优化后的 A片段列表 和 B片段列表
+   179                                                   """
+   180                                                   # 1. 构造输入 (Joint Input)
+   181                                                   # Batch the two texts to avoid two separate tokenizer + LM forward passes.
+   182                                                   inputs = self.generator.tokenizer(
+   183                                                       [text_a, text_b],
+   184                                                       return_tensors="pt",
+   185                                                       padding="max_length",
+   186                                                       truncation=True,
+   187                                                       max_length=512,
+   188                                                   ).to(self.device)
+   189                                           
+   190                                                   with torch.inference_mode():
+   191                                                       hs = self.generator.lm(**inputs).last_hidden_state  # [2, L, H]
+   192                                           
+   193                                                   # Split batch back into the A/B shapes expected downstream (batch_size=1 each).
+   194                                                   embeds_a = hs[0:1, :, :]
+   195                                                   embeds_b = hs[1:2, :, :]
+   196                                                   input_ids_a = inputs["input_ids"][0:1, :]
+   197                                                   input_ids_b = inputs["input_ids"][1:2, :]
+   198                                                   attention_mask_a = inputs["attention_mask"][0:1, :]
+   199                                                   attention_mask_b = inputs["attention_mask"][1:2, :]
+   200                                           
+   201                                                   td = TensorDict(
+   202                                                       {
+   203                                                           "token_embeddings_a": embeds_a,
+   204                                                           "token_embeddings_b": embeds_b,
+   205                                                           "attention_mask_a": attention_mask_a,
+   206                                                           "attention_mask_b": attention_mask_b,
+   207                                                           "length_a": attention_mask_a.sum(dim=1),
+   208                                                           "length_b": attention_mask_b.sum(dim=1),
+   209                                                           "input_ids_a": input_ids_a,
+   210                                                           "input_ids_b": input_ids_b,
+   211                                                       },
+   212                                                       batch_size=1,
+   213                                                   )
+   214                                           
+   215                                                   # 2. Greedy Decoding 获取最佳切分动作
+   216                                                   with torch.inference_mode():
+   217                                                       out = self.policy(
+   218                                                           td,
+   219                                                           None,
+   220                                                           phase="test",
+   221                                                           select_best=True,
+   222                                                           decode_type="greedy",
+   223                                                           compute_reward=False,
+   224                                                       )
+   225                                                   
+   226                                                   actions = out['actions'][0] # [2 * max_segments]
+   227                                           
+   228                                                   # 3. 解析动作 -> 文本片段
+   229                                                   # NOTE: In this repo, actions are interleaved: [A0, B0, A1, B1, ...]
+   230                                                   # See `inspect_punctuation_cases.py` and `MaxSimEnv._step` (full-plan interleaved layout).
+   231                                                   if not isinstance(actions, torch.Tensor):
+   232                                                       actions = torch.as_tensor(actions, device=self.device)
+   233                                                   total = int(actions.numel())
+   234                                                   if total % 2 != 0:
+   235                                                       raise ValueError(f"Expected even number of action entries (A/B interleaved), got {total}")
+   236                                                   max_segments = total // 2
+   237                                                   pointers_a = actions[0: 2 * max_segments: 2].tolist()
+   238                                                   pointers_b = actions[1: 2 * max_segments: 2].tolist()
+   239                                                   
+   240                                                   # Reconstruct segments in **token-index space** (pointers are token positions).
+   241                                                   # This avoids the previous mismatch where pointers (token indices) were applied
+   242                                                   # to `prompt.lower().split()` (word indices).
+   243                                                   segments_a = get_segments_from_token_pointers(
+   244                                                       tokenizer=self.generator.tokenizer,
+   245                                                       input_ids=input_ids_a[0],
+   246                                                       attention_mask=attention_mask_a[0],
+   247                                                       pointers=pointers_a,
+   248                                                   )
+   249                                                   segments_b = get_segments_from_token_pointers(
+   250                                                       tokenizer=self.generator.tokenizer,
+   251                                                       input_ids=input_ids_b[0],
+   252                                                       attention_mask=attention_mask_b[0],
+   253                                                       pointers=pointers_b,
+   254                                                   )
+   255                                                   
+   256                                                   return segments_a, segments_b
+
+Total time: 0.206163 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/MaxSimSplitter.py
+Function: MaxSimSplitter.encode_text at line 381
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   381                                               def encode_text(self, text: str) -> dict:
+   382                                                   """
+   383                                                   Encode a single text once and return token-level embeddings + masks + pooled embeddings.
+   384                                           
+   385                                                   Returns a dict with:
+   386                                                     - token_emb:      torch.Tensor [L, H] (last_hidden_state for this text)
+   387                                                     - attention_mask: torch.Tensor [L]
+   388                                                     - input_ids:      torch.Tensor [L]
+   389                                                     - length:         int (sum(attention_mask))
+   390                                                     - pooled_knn:     torch.Tensor [H]  (masked mean over *all* tokens incl. CLS, matches EmbeddingModel.get_embedding)
+   391                                                     - pooled_no_cls:  torch.Tensor [H]  (masked mean over tokens excluding CLS)
+   392                                                   """
+   393        11          0.0      0.0      0.0          import torch
+   394                                           
+   395        33         16.1      0.5      7.8          inputs = self.generator.tokenizer(
+   396        11          0.0      0.0      0.0              text,
+   397        11          0.0      0.0      0.0              return_tensors="pt",
+   398        11          0.0      0.0      0.0              padding=True,  # single example => no pad beyond itself
+   399        11          0.0      0.0      0.0              truncation=True,
+   400        11          0.0      0.0      0.0              max_length=512,
+   401        11          2.6      0.2      1.3          ).to(self.device)
+   402                                           
+   403        22          0.5      0.0      0.2          with torch.inference_mode():
+   404        11        178.9     16.3     86.8              hs = self.generator.lm(**inputs).last_hidden_state  # [1, L, H]
+   405                                           
+   406        11          0.1      0.0      0.1          token_emb = hs[0]  # [L, H]
+   407        11          0.1      0.0      0.0          attn = inputs.get("attention_mask", None)
+   408        11          0.0      0.0      0.0          if attn is None:
+   409                                                       attention_mask = torch.ones((token_emb.shape[0],), device=token_emb.device, dtype=torch.long)
+   410                                                   else:
+   411        11          0.2      0.0      0.1              attention_mask = attn[0].to(device=token_emb.device)
+   412        11          0.1      0.0      0.0          input_ids = inputs["input_ids"][0]
+   413        11          1.8      0.2      0.9          length = int(attention_mask.sum().item()) if attention_mask is not None else int(token_emb.shape[0])
+   414        11          0.1      0.0      0.0          length = max(0, min(length, int(token_emb.shape[0])))
+   415                                           
+   416                                                   # pooled_knn: masked mean over all tokens including CLS (matches EmbeddingModel.get_embedding)
+   417        11          0.0      0.0      0.0          if length == 0:
+   418                                                       pooled_knn = token_emb.mean(dim=0)
+   419                                                   else:
+   420        11          0.7      0.1      0.4              am = attention_mask[:length].to(dtype=token_emb.dtype).unsqueeze(-1)  # [L,1]
+   421        11          2.5      0.2      1.2              pooled_knn = (token_emb[:length] * am).sum(dim=0) / am.sum(dim=0).clamp_min(1.0)
+   422                                           
+   423                                                   # pooled_no_cls: masked mean excluding CLS token 0 (matches MaxSimEnv-style full embedding)
+   424        11          0.0      0.0      0.0          if length <= 1:
+   425                                                       pooled_no_cls = pooled_knn
+   426                                                   else:
+   427        11          0.5      0.0      0.2              am2 = attention_mask[1:length].to(dtype=token_emb.dtype).unsqueeze(-1)
+   428        11          2.0      0.2      1.0              pooled_no_cls = (token_emb[1:length] * am2).sum(dim=0) / am2.sum(dim=0).clamp_min(1.0)
+   429                                           
+   430        11          0.0      0.0      0.0          return {
+   431        11          0.0      0.0      0.0              "token_emb": token_emb,
+   432        11          0.0      0.0      0.0              "attention_mask": attention_mask,
+   433        11          0.0      0.0      0.0              "input_ids": input_ids,
+   434        11          0.0      0.0      0.0              "length": length,
+   435        11          0.0      0.0      0.0              "pooled_knn": pooled_knn,
+   436        11          0.0      0.0      0.0              "pooled_no_cls": pooled_no_cls,
+   437                                                   }
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/MaxSimSplitter.py
+Function: MaxSimSplitter.split_pair_return_maxsim_tensors_from_encoded at line 522
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   522                                               def split_pair_return_maxsim_tensors_from_encoded(self, enc_a: dict, enc_b: dict) -> tuple:
+   523                                                   """
+   524                                                   Same as split_pair_return_maxsim_tensors, but reuses pre-encoded token embeddings for A and B.
+   525                                                   This lets the caller encode the query once (for KNN + MaxSim) and only encode the candidate once.
+   526                                                   """
+   527                                                   import torch
+   528                                           
+   529                                                   # Pad to a common length for the policy.
+   530                                                   tok_a: torch.Tensor = enc_a["token_emb"]
+   531                                                   tok_b: torch.Tensor = enc_b["token_emb"]
+   532                                                   am_a: torch.Tensor = enc_a["attention_mask"]
+   533                                                   am_b: torch.Tensor = enc_b["attention_mask"]
+   534                                                   ids_a: torch.Tensor = enc_a["input_ids"]
+   535                                                   ids_b: torch.Tensor = enc_b["input_ids"]
+   536                                                   la: int = int(enc_a["length"])
+   537                                                   lb: int = int(enc_b["length"])
+   538                                           
+   539                                                   L = int(max(tok_a.shape[0], tok_b.shape[0]))
+   540                                                   H = int(tok_a.shape[1])
+   541                                           
+   542                                                   def _pad_2d(x: torch.Tensor, L: int) -> torch.Tensor:
+   543                                                       if x.shape[0] == L:
+   544                                                           return x
+   545                                                       pad = torch.zeros((L - x.shape[0], x.shape[1]), device=x.device, dtype=x.dtype)
+   546                                                       return torch.cat([x, pad], dim=0)
+   547                                           
+   548                                                   def _pad_1d(x: torch.Tensor, L: int) -> torch.Tensor:
+   549                                                       if x.shape[0] == L:
+   550                                                           return x
+   551                                                       pad = torch.zeros((L - x.shape[0],), device=x.device, dtype=x.dtype)
+   552                                                       return torch.cat([x, pad], dim=0)
+   553                                           
+   554                                                   tok_a_p = _pad_2d(tok_a, L)
+   555                                                   tok_b_p = _pad_2d(tok_b, L)
+   556                                                   am_a_p = _pad_1d(am_a, L)
+   557                                                   am_b_p = _pad_1d(am_b, L)
+   558                                                   ids_a_p = _pad_1d(ids_a, L)
+   559                                                   ids_b_p = _pad_1d(ids_b, L)
+   560                                           
+   561                                                   td = TensorDict(
+   562                                                       {
+   563                                                           "token_embeddings_a": tok_a_p.unsqueeze(0),
+   564                                                           "token_embeddings_b": tok_b_p.unsqueeze(0),
+   565                                                           "attention_mask_a": am_a_p.unsqueeze(0),
+   566                                                           "attention_mask_b": am_b_p.unsqueeze(0),
+   567                                                           "length_a": torch.tensor([la], device=self.device),
+   568                                                           "length_b": torch.tensor([lb], device=self.device),
+   569                                                           "input_ids_a": ids_a_p.unsqueeze(0),
+   570                                                           "input_ids_b": ids_b_p.unsqueeze(0),
+   571                                                       },
+   572                                                       batch_size=1,
+   573                                                   )
+   574                                           
+   575                                                   with torch.inference_mode():
+   576                                                       out = self.policy(
+   577                                                           td,
+   578                                                           None,
+   579                                                           phase="test",
+   580                                                           select_best=True,
+   581                                                           decode_type="greedy",
+   582                                                           compute_reward=False,
+   583                                                       )
+   584                                           
+   585                                                   actions = out["actions"][0]
+   586                                                   if not isinstance(actions, torch.Tensor):
+   587                                                       actions = torch.as_tensor(actions, device=self.device)
+   588                                                   total = int(actions.numel())
+   589                                                   if total % 2 != 0:
+   590                                                       raise ValueError(f"Expected even number of action entries (A/B interleaved), got {total}")
+   591                                                   max_segments = total // 2
+   592                                                   pointers_a = actions[0 : 2 * max_segments : 2].tolist()
+   593                                                   pointers_b = actions[1 : 2 * max_segments : 2].tolist()
+   594                                           
+   595                                                   sent_a, full_a = self._segment_embeds_from_pointers(tok_a, la, pointers_a)
+   596                                                   sent_b, full_b = self._segment_embeds_from_pointers(tok_b, lb, pointers_b)
+   597                                           
+   598                                                   query_tensor = torch.cat([sent_a, full_a], dim=0)
+   599                                                   corpus_tensor = torch.cat([sent_b, full_b], dim=0)
+   600                                                   return query_tensor, corpus_tensor
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/embedding_model.py
+Function: EmbeddingModel.get_embedding at line 86
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    86                                               def get_embedding(self, text):
+    87                                                   """ 获取文本的向量嵌入 """
+    88                                                 
+    89                                                   device = next(self.model.parameters()).device
+    90                                               
+    91                                                   inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+    92                                                   
+    93                                                   inputs = {k: v.to(device) for k, v in inputs.items()}
+    94                                           
+    95                                                   with torch.no_grad():
+    96                                                       outputs = self.model(**inputs)
+    97                                           
+    98                                                   hs = outputs.last_hidden_state  # [1, L, H]
+    99                                                   attn = inputs.get("attention_mask", None)
+   100                                                   if attn is None:
+   101                                                       pooled = hs.mean(dim=1)
+   102                                                   else:
+   103                                                       attn_f = attn.to(dtype=hs.dtype).unsqueeze(-1)
+   104                                                       pooled = (hs * attn_f).sum(dim=1) / attn_f.sum(dim=1).clamp_min(1.0)
+   105                                           
+   106                                                   return pooled.squeeze().cpu().numpy()
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/embedding_model.py
+Function: EmbeddingModel.get_embeddings_tensor at line 146
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   146                                               def get_embeddings_tensor(
+   147                                                   self, texts: list[str], device: torch.device | str | None = None
+   148                                               ) -> torch.Tensor:
+   149                                                   """
+   150                                                   Batched version of `get_embedding_tensor`.
+   151                                           
+   152                                                   Semantics: matches what you'd get by calling `get_embedding_tensor` on each
+   153                                                   text independently (batch_size=1 => no padding) by using **masked mean pooling**
+   154                                                   over non-padding tokens when batching introduces padding.
+   155                                           
+   156                                                   Returns:
+   157                                                       torch.Tensor of shape [len(texts), hidden_size] on `device`.
+   158                                                   """
+   159                                                   if not texts:
+   160                                                       raise ValueError("texts must be a non-empty list[str]")
+   161                                           
+   162                                                   if device is None:
+   163                                                       device = next(self.model.parameters()).device
+   164                                                   else:
+   165                                                       device = torch.device(device)
+   166                                           
+   167                                                   # Ensure model is on the target device.
+   168                                                   #
+   169                                                   # Important: `torch.device("cuda")` has `index=None`, while a model is typically
+   170                                                   # on `cuda:0`. Treat these as equivalent to avoid an expensive `.to(...)` call
+   171                                                   # on every invocation in hot paths.
+   172                                                   cur = next(self.model.parameters()).device
+   173                                                   same_device = (cur == device)
+   174                                                   if not same_device and cur.type == "cuda" and device.type == "cuda":
+   175                                                       # If caller asked for generic "cuda", accept the current cuda:<idx>.
+   176                                                       if device.index is None:
+   177                                                           same_device = True
+   178                                                       # If caller asked for a specific cuda:<idx>, require exact match.
+   179                                                   if not same_device:
+   180                                                       self.model.to(device)
+   181                                           
+   182                                                   inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
+   183                                                   inputs = {k: v.to(device) for k, v in inputs.items()}
+   184                                           
+   185                                                   with torch.no_grad():
+   186                                                       outputs = self.model(**inputs)
+   187                                           
+   188                                                   hs = outputs.last_hidden_state  # [B, L, H]
+   189                                                   attn = inputs.get("attention_mask", None)
+   190                                                   if attn is None:
+   191                                                       # Fallback to unmasked mean (shouldn't happen for HF tokenizers)
+   192                                                       return hs.mean(dim=1)
+   193                                           
+   194                                                   # Masked mean pooling: sum over real tokens / count(real tokens)
+   195                                                   # This reproduces the batch_size=1 behavior (no pad tokens).
+   196                                                   attn_f = attn.to(dtype=hs.dtype).unsqueeze(-1)  # [B, L, 1]
+   197                                                   summed = (hs * attn_f).sum(dim=1)  # [B, H]
+   198                                                   counts = attn_f.sum(dim=1).clamp_min(1.0)  # [B, 1]
+   199                                                   return summed / counts
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified_splitter.py
+Function: VerifiedSplitterDecisionPolicy._maxsim_similarity at line 192
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   192                                               def _maxsim_similarity(self, query: str, candidate: str) -> float:
+   193                                                   """
+   194                                                   Compute MaxSim similarity in [0, 1] using the provided splitter + its embedding model.
+   195                                                   """
+   196                                                   if self.splitter is None:
+   197                                                       raise ValueError(
+   198                                                           "VerifiedSplitterDecisionPolicy requires `splitter` (MaxSimSplitter) to be provided."
+   199                                                       )
+   200                                           
+   201                                                   try:
+   202                                                       import torch
+   203                                                       import torch.nn.functional as F
+   204                                                   except Exception as e:
+   205                                                       raise RuntimeError(
+   206                                                           "VerifiedSplitterDecisionPolicy requires torch to compute MaxSim similarity."
+   207                                                       ) from e
+   208                                           
+   209                                                   query_tensor, corpus_tensor = self.splitter.split_pair_return_maxsim_tensors(query, candidate)
+   210                                                   return self._maxsim_from_tensors(query_tensor, corpus_tensor)
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified_splitter.py
+Function: VerifiedSplitterDecisionPolicy._maxsim_similarity_from_encoded at line 212
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   212                                               def _maxsim_similarity_from_encoded(self, query_enc: dict, candidate_prompt: str) -> float:
+   213                                                   """
+   214                                                   MaxSim similarity where the query has already been encoded once (token embeddings + pooled embedding).
+   215                                                   We still need to encode the candidate prompt once to get its token embeddings for the RL splitter.
+   216                                                   """
+   217                                                   if self.splitter is None:
+   218                                                       raise ValueError("VerifiedSplitterDecisionPolicy requires `splitter` (MaxSimSplitter) to be provided.")
+   219                                                   import torch
+   220                                                   import torch.nn.functional as F
+   221                                           
+   222                                                   # Encode candidate once (token-level). This is the part you may want to report separately.
+   223                                                   t0 = time.time()
+   224                                                   cand_enc = self.splitter.encode_text(candidate_prompt)
+   225                                                   dt = time.time() - t0
+   226                                                   # Best-effort accumulate timing for reporting (does not affect correctness)
+   227                                                   try:
+   228                                                       self._timing_candidate_encode_s = getattr(self, "_timing_candidate_encode_s", 0.0) + float(dt)
+   229                                                       self._timing_candidate_encode_n = getattr(self, "_timing_candidate_encode_n", 0) + 1
+   230                                                   except Exception:
+   231                                                       pass
+   232                                           
+   233                                                   query_tensor, corpus_tensor = self.splitter.split_pair_return_maxsim_tensors_from_encoded(query_enc, cand_enc)
+   234                                                   return self._maxsim_from_tensors(query_tensor, corpus_tensor)
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified_splitter.py
+Function: VerifiedSplitterDecisionPolicy._select_nn_by_maxsim at line 236
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   236                                               def _select_nn_by_maxsim(
+   237                                                   self, prompt: str
+   238                                               ) -> Tuple[Optional[EmbeddingMetadataObj], Optional[float]]:
+   239                                                   """
+   240                                                   Select the nearest-neighbor metadata object using MaxSim similarity.
+   241                                           
+   242                                                   Returns:
+   243                                                       (best_metadata, best_similarity) where similarity is in [0, 1].
+   244                                                   """
+   245                                                   if self.cache is None:
+   246                                                       return None, None
+   247                                           
+   248                                                   candidates: list[EmbeddingMetadataObj] = []
+   249                                           
+   250                                                   if self.candidate_selection == "all":
+   251                                                       candidates = self.cache.get_all_embedding_metadata_objects()
+   252                                                   elif self.candidate_selection == "top_k":
+   253                                                       knn = self.cache.get_knn(prompt=prompt, k=max(1, int(self.candidate_k)))
+   254                                                       for _db_score, embedding_id in knn:
+   255                                                           try:
+   256                                                               candidates.append(self.cache.get_metadata(embedding_id=embedding_id))
+   257                                                           except Exception:
+   258                                                               continue
+   259                                                   else:
+   260                                                       raise ValueError(
+   261                                                           f"Unknown candidate_selection={self.candidate_selection!r}. Use 'top_k' or 'all'."
+   262                                                       )
+   263                                           
+   264                                                   if not candidates:
+   265                                                       return None, None
+   266                                           
+   267                                                   best_meta: Optional[EmbeddingMetadataObj] = None
+   268                                                   best_s: float = -1.0
+   269                                           
+   270                                                   for meta in candidates:
+   271                                                       cached_prompt = getattr(meta, "prompt", "") or ""
+   272                                                       if not cached_prompt:
+   273                                                           # Can't compute MaxSim without cached prompt text; skip.
+   274                                                           continue
+   275                                                       try:
+   276                                                           s = self._maxsim_similarity(prompt, cached_prompt)
+   277                                                       except Exception as e:
+   278                                                           self.logger.warning(f"MaxSim similarity failed for one candidate: {e}")
+   279                                                           continue
+   280                                                       if s > best_s:
+   281                                                           best_s = s
+   282                                                           best_meta = meta
+   283                                           
+   284                                                   if best_meta is None:
+   285                                                       return None, None
+   286                                                   return best_meta, best_s
+
+Total time: 0.356921 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified_splitter.py
+Function: VerifiedSplitterDecisionPolicy.process_request at line 288
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   288                                               def process_request(
+   289                                                   self, prompt: str, system_prompt: Optional[str], id_set: int
+   290                                               ) -> Tuple[bool, str, EmbeddingMetadataObj]:
+   291        10          0.0      0.0      0.0          if self.inference_engine is None or self.cache is None:
+   292                                                       raise ValueError("Policy has not been setup")
+   293                                           
+   294                                                   # Optimized path: encode query ONCE and reuse it for:
+   295                                                   # - KNN selection (pooled embedding)
+   296                                                   # - MaxSim/RL (token embeddings)
+   297        10          0.0      0.0      0.0          if self.splitter is None:
+   298                                                       raise ValueError("VerifiedSplitterDecisionPolicy requires `splitter` (MaxSimSplitter) to be provided.")
+   299                                           
+   300        10        190.6     19.1     53.4          query_enc = self.splitter.encode_text(prompt)
+   301        10          0.0      0.0      0.0          query_knn_emb = query_enc["pooled_knn"]  # torch tensor on device
+   302                                                   # HNSW runs on CPU; pass a CPU list[float]
+   303        10          1.2      0.1      0.3          query_knn_emb_cpu = query_knn_emb.detach().float().cpu().tolist()
+   304                                           
+   305        10        163.8     16.4     45.9          nn_metadata, similarity_score = self._select_nn_by_maxsim_with_query(prompt, query_enc, query_knn_emb_cpu)
+   306        10          0.0      0.0      0.0          if nn_metadata is None or similarity_score is None:
+   307                                                       response = self.inference_engine.create(prompt=prompt, system_prompt=system_prompt)
+   308                                                       self.__cache_add(prompt=prompt, response=response, id_set=id_set)
+   309                                                       return False, response, EmbeddingMetadataObj(embedding_id=-1, response="")
+   310                                           
+   311        10          0.5      0.0      0.1          action = self.bayesian.select_action(similarity_score=similarity_score, metadata=nn_metadata)
+   312                                           
+   313        10          0.0      0.0      0.0          match action:
+   314        10          0.0      0.0      0.0              case _Action.EXPLOIT:
+   315                                                           return True, nn_metadata.response, nn_metadata
+   316        10          0.0      0.0      0.0              case _Action.EXPLORE:
+   317        10          0.1      0.0      0.0                  response = self.inference_engine.create(prompt=prompt, system_prompt=system_prompt)
+   318        20          0.7      0.0      0.2                  self.__update_cache(
+   319        10          0.0      0.0      0.0                      response=response,
+   320        10          0.0      0.0      0.0                      nn_metadata=nn_metadata,
+   321        10          0.0      0.0      0.0                      similarity_score=similarity_score,
+   322        10          0.0      0.0      0.0                      embedding_id=nn_metadata.embedding_id,
+   323        10          0.0      0.0      0.0                      prompt=prompt,
+   324        10          0.0      0.0      0.0                      label_id_set=id_set,
+   325                                                           )
+   326        10          0.0      0.0      0.0                  return False, response, nn_metadata
+
+Total time: 0.163436 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified_splitter.py
+Function: VerifiedSplitterDecisionPolicy._select_nn_by_maxsim_with_query at line 328
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   328                                               def _select_nn_by_maxsim_with_query(
+   329                                                   self, prompt: str, query_enc: dict, query_knn_emb_cpu: list[float]
+   330                                               ) -> Tuple[Optional[EmbeddingMetadataObj], Optional[float]]:
+   331                                                   """
+   332                                                   Like `_select_nn_by_maxsim`, but reuses the already-encoded query:
+   333                                                     - uses pooled embedding for vector DB KNN
+   334                                                     - uses query token embeddings for MaxSim/RL scoring
+   335                                                   """
+   336        10          0.0      0.0      0.0          if self.cache is None:
+   337                                                       return None, None
+   338                                           
+   339        10          0.0      0.0      0.0          candidates: list[EmbeddingMetadataObj] = []
+   340        10          0.0      0.0      0.0          if self.candidate_selection == "all":
+   341                                                       candidates = self.cache.get_all_embedding_metadata_objects()
+   342        10          0.0      0.0      0.0          elif self.candidate_selection == "top_k":
+   343        20          1.9      0.1      1.1              knn = self.cache.get_knn_from_embedding(
+   344        10          0.0      0.0      0.0                  embedding=query_knn_emb_cpu, k=max(1, int(self.candidate_k))
+   345                                                       )
+   346        20          0.0      0.0      0.0              for _db_score, embedding_id in knn:
+   347        10          0.0      0.0      0.0                  try:
+   348        10          0.1      0.0      0.1                      candidates.append(self.cache.get_metadata(embedding_id=embedding_id))
+   349                                                           except Exception:
+   350                                                               continue
+   351                                                   else:
+   352                                                       raise ValueError(
+   353                                                           f"Unknown candidate_selection={self.candidate_selection!r}. Use 'top_k' or 'all'."
+   354                                                       )
+   355                                           
+   356        10          0.0      0.0      0.0          if not candidates:
+   357                                                       return None, None
+   358                                           
+   359                                                   # If we are using cached candidate segment tensors, compute the query tensor ONCE.
+   360        10          0.0      0.0      0.0          query_tensor = None
+   361        10          0.0      0.0      0.0          if self.use_cached_candidate_segments and self.splitter is not None:
+   362        10          0.0      0.0      0.0              try:
+   363        10        120.3     12.0     73.6                  query_tensor = self.splitter.split_text_return_maxsim_tensor_from_encoded(query_enc)
+   364                                                       except Exception as e:
+   365                                                           self.logger.warning(f"Query single-text segmentation failed; falling back to pair MaxSim path: {e}")
+   366                                                           query_tensor = None
+   367                                           
+   368        10          0.0      0.0      0.0          best_meta: Optional[EmbeddingMetadataObj] = None
+   369        10          0.0      0.0      0.0          best_s: float = -1.0
+   370                                           
+   371        20          0.0      0.0      0.0          for meta in candidates:
+   372        10          0.0      0.0      0.0              cached_prompt = getattr(meta, "prompt", "") or ""
+   373        10          0.0      0.0      0.0              if not cached_prompt:
+   374                                                           continue
+   375        10          0.0      0.0      0.0              try:
+   376        10          0.0      0.0      0.0                  if query_tensor is not None:
+   377        10          0.0      0.0      0.0                      cand_tensor = getattr(meta, "cached_maxsim_tensor", None)
+   378        10          0.0      0.0      0.0                      if cand_tensor is None:
+   379                                                                   # Lazy-fill cache for this candidate (still avoids re-encoding it next time)
+   380         1          0.0      0.0      0.0                          try:
+   381         1         27.2     27.2     16.6                              cand_tensor = self.splitter.split_text_return_maxsim_tensor(cached_prompt)
+   382         1          0.0      0.0      0.0                              meta.cached_maxsim_tensor = cand_tensor.detach()
+   383         1          0.0      0.0      0.0                              self.cache.update_metadata(embedding_id=meta.embedding_id, embedding_metadata=meta)
+   384                                                                   except Exception:
+   385                                                                       cand_tensor = None
+   386        10          0.0      0.0      0.0                      if cand_tensor is None:
+   387                                                                   # Fall back to existing encoded-pair path for correctness
+   388                                                                   s = self._maxsim_similarity_from_encoded(query_enc, cached_prompt)
+   389                                                               else:
+   390        10         13.6      1.4      8.3                          s = self._maxsim_from_tensors(query_tensor, cand_tensor)
+   391                                                           else:
+   392                                                               s = self._maxsim_similarity_from_encoded(query_enc, cached_prompt)
+   393                                                       except Exception as e:
+   394                                                           self.logger.warning(f"MaxSim similarity failed for one candidate: {e}")
+   395                                                           continue
+   396        10          0.0      0.0      0.0              if s > best_s:
+   397        10          0.0      0.0      0.0                  best_s = s
+   398        10          0.0      0.0      0.0                  best_meta = meta
+   399                                           
+   400        10          0.0      0.0      0.0          if best_meta is None:
+   401                                                       return None, None
+   402        10          0.0      0.0      0.0          return best_meta, best_s
+

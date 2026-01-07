@@ -26,8 +26,7 @@ I have added the debug policy in case you want to check the results of the segme
 The caching system algorithm is taken from the original "https://github.com/vcache-project/vCache/tree/master" repo, it includes all the baseline and I have added our method as one of the baselines (the name is verified splitter), you can try to run the caching experiments like this:
 
 ```bash
-python benchmarks/eval_sembenchmark_verified_splitter.py   --dataset vCache/SemBenchmarkClassification   --llm-col response_llama_3_8b   --delta 0.02   --similarity-evaluator string   --sleep 0.1   --splitter-checkpoint /data2/ali/checkpoints_words   --candidate-selection top_k --candidate-k 1 --splitter-device cuda   --output-json results/verified_splitter_cuda.json
-```
+python benchmarks/eval_sembenchmark_verified_splitter.py --dataset vCache/SemBenchmarkClassification --llm-col response_llama_3_8b --delta 0.02 --similarity-evaluator string --sleep 0.1 --splitter-checkpoint /data2/ali/checkpoints_seperate --candidate-selection top_k --candidate-k 1 --splitter-device cuda --use-cached-candidate-segments --output-json results/verified_splitter_cuda_cachedcandsegments.json```
 
 this experiments is for benchmark "SemBenchmarkClassification" dataset in our method. You need to put the sleep and play with it since it is important for sync, but it should not be included in the latency, this is a system problem not the method.
 

@@ -14,7 +14,7 @@ The training code is similar to the original training code I have just made some
 it is now based on the pair of labeled samples, you can run the training code by executing the following command:
 
 ```bash
-python RL4COTrainer.py   --train_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_benchmark2500_pairs_balanced_train.json   --val_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_benchmark2500_pairs_balanced_val.json   --test_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_benchmark2500_pairs_balanced_test.json   --checkpoint_dir /data2/ali/checkpoints_words   --debug_policy   --debug_policy_log_path /data2/ali/checkpoints_words/policy_debug.jsonl   --debug_policy_every_n_epochs 1   --debug_policy_batch_size 8   --debug_policy_topk 10   --debug_policy_n_samples 2
+ python RL4COTrainer.py   --train_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_benchmark2500_pairs_balanced_train.json   --val_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_benchmark2500_pairs_balanced_val.json   --test_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_benchmark2500_pairs_balanced_test.json   --checkpoint_dir /data2/ali/checkpoints_seperate   --policy_mode separate   --debug_policy   --debug_policy_log_path /data2/ali/checkpoints_seperate/policy_debug.jsonl   --debug_policy_every_n_epochs 1   --debug_policy_batch_size 8   --debug_policy_topk 10   --debug_policy_n_samples 2
 ```
 
 I have added the debug policy in case you want to check the results of the segmentation, you can run this command in both of the directory of the two versions.

@@ -53,7 +53,7 @@ python -m pip install -e vcache/vcache_core/cache/embedding_store/hnswlib
 
 This is just for verification that we are actually using the HNSW-Multi (Multivector HNSW)
 
-### 3) Verify the custom APIs are present
+### 1) Verify the custom APIs are present
 
 ```bash
 python - <<'PY'
@@ -72,7 +72,7 @@ If this prints `hnswlib MISSING: ...`, you’re not importing the custom fork (o
 
 This is the command that is used for evaluation of the script, please pay attention to the arugments (--candidate-selection multivector_top_k \ --candidate-k 10) and for all the evaluation please set the **--sleep** (IT IS VERY IMPORTANT)
 
-## Run the evaluation (CUDA)
+## 2) Run the evaluation (CUDA)
 
 From the repo root:
 
@@ -89,7 +89,7 @@ python benchmarks/eval_sembenchmark_verified_splitter.py \
   --splitter-device cuda \
   --output-json results/verified_splitter_cuda_multivector.json
 
-
+```
 
 ## Baselines and Benchmark Scripts
 

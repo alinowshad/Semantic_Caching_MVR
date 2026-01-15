@@ -38,6 +38,59 @@ python benchmarks/eval_sembenchmark_verified.py   --dataset vCache/SemBenchmarkC
 
 ---
 
+
+
+### Caching Inference (Caching System + HNSW-Multi)
+
+So since the hnsw libraries are with same (our local one and original) it is better to completely create a new directory and conda environment for this caching system, otherwise if you run this installation it would delete the old HNSW which is used for the baseline evaluations.
+
+You need to install the following local library (adjust the path based on your system)
+
+```bash
+python -m pip install -e vcache/vcache_core/cache/embedding_store/hnswlib
+```
+
+
+This is just for verification that we are actually using the HNSW-Multi (Multivector HNSW)
+
+### 3) Verify the custom APIs are present
+
+```bash
+python - <<'PY'
+import hnswlib
+p = hnswlib.Index(space="ip", dim=4)
+missing = []
+if not hasattr(p, "knn_query_skipping_duplicates_with_parent"):
+    missing.append("knn_query_skipping_duplicates_with_parent")
+print("hnswlib OK" if not missing else f"hnswlib MISSING: {missing}")
+PY
+```
+
+If this prints `hnswlib MISSING: ...`, you’re not importing the custom fork (or it didn’t build).
+
+---
+
+This is the command that is used for evaluation of the script, please pay attention to the arugments (--candidate-selection multivector_top_k \ --candidate-k 10) and for all the evaluation please set the **--sleep** (IT IS VERY IMPORTANT)
+
+## Run the evaluation (CUDA)
+
+From the repo root:
+
+```bash
+python benchmarks/eval_sembenchmark_verified_splitter.py \
+  --dataset vCache/SemBenchmarkClassification \
+  --llm-col response_llama_3_8b \
+  --delta 0.02 \
+  --similarity-evaluator string \
+  --sleep 0.1 \
+  --splitter-checkpoint /data2/ali/checkpoints_seperate \
+  --candidate-selection multivector_top_k \
+  --candidate-k 10 \
+  --splitter-device cuda \
+  --output-json results/verified_splitter_cuda_multivector.json
+
+
+
 ## Baselines and Benchmark Scripts
 
 in the benchmark folder there is file called "/vcahce/benchmarks/benchmark.py" in this file there are all the based line that is the original vcache paper, you can create scripts like eval_sembenchmark_verified* and run those baselines on those datasets.

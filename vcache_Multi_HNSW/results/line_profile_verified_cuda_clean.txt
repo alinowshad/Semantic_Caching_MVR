@@ -1,0 +1,458 @@
+args={'dataset': 'vCache/SemBenchmarkClassification', 'llm_col': 'response_llama_3_8b', 'device': 'cuda', 'delta': 0.02, 'max_capacity': 200000, 'max_samples': 30, 'warmup_samples': 3, 'profile_samples': 10, 'sleep': 0.0, 'hf_cache_base': '/data2/ali/hf', 'output': 'results/line_profile_verified_cuda_clean.txt'}
+python=3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]
+cwd=/home/ali/vcahce
+
+Timer unit: 0.001 s
+
+Total time: 0.149735 s
+File: /home/ali/vcahce/benchmarks/line_profile_verified.py
+Function: main.<locals>.<lambda> at line 216
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   216         2        149.7     74.9    100.0          lambda: _run_loop(
+   217         1          0.0      0.0      0.0              vcache=vcache,
+   218         1          0.0      0.0      0.0              rows=rows_list[int(args.warmup_samples) :],
+   219         1          0.0      0.0      0.0              llm_col=args.llm_col,
+   220         1          0.0      0.0      0.0              profile_samples=int(args.profile_samples),
+   221         1          0.0      0.0      0.0              sleep_s=float(args.sleep),
+   222                                                   )
+
+Total time: 0.149535 s
+File: /home/ali/vcahce/vcache/main.py
+Function: VCache.infer_with_cache_info at line 53
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    53                                               def infer_with_cache_info(
+    54                                                   self,
+    55                                                   prompt: str,
+    56                                                   system_prompt: Optional[str] = None,
+    57                                                   id_set: int = -1,
+    58                                               ) -> Tuple[bool, str, EmbeddingMetadataObj, EmbeddingMetadataObj]:
+    59                                                   """Infers a response and returns the cache hit status and metadata.
+    60                                           
+    61                                                   Args:
+    62                                                       prompt (str): The prompt to create a response for.
+    63                                                       system_prompt (Optional[str]): The optional system prompt to use
+    64                                                           for the response. Overrides the system prompt in the
+    65                                                           VCacheConfig if provided.
+    66                                                       id_set (int): The set identifier for the embedding. This is used in the
+    67                                                           benchmark to identify if the nearest neighbor is from the same set
+    68                                                           (if the cached response is correct or incorrect).
+    69                                           
+    70                                                   Returns:
+    71                                                       Tuple[bool, str, EmbeddingMetadataObj, EmbeddingMetadataObj]: A tuple containing the cache
+    72                                                           hit status, the response, the metadata of the response and nearest neighbor metadata.
+    73                                                   """
+    74        10          0.0      0.0      0.0          if system_prompt is None:
+    75                                                       system_prompt = self.vcache_config.system_prompt
+    76                                           
+    77        10          0.0      0.0      0.0          if self.vcache_config.eviction_policy.is_evicting():
+    78                                                       response = self.__generate_response(prompt, system_prompt)
+    79                                                       return (
+    80                                                           False,
+    81                                                           response,
+    82                                                           EmbeddingMetadataObj(embedding_id=-1, response=response, id_set=id_set),
+    83                                                           EmbeddingMetadataObj(embedding_id=-1, response=response, id_set=id_set),
+    84                                                       )
+    85                                           
+    86        20        146.8      7.3     98.2          is_cache_hit, response, nn_metadata = self.vcache_policy.process_request(
+    87        10          0.0      0.0      0.0              prompt, system_prompt, id_set
+    88                                                   )
+    89                                           
+    90        10          0.0      0.0      0.0          if nn_metadata is not None:
+    91        10          0.0      0.0      0.0              self.vcache_config.eviction_policy.update_eviction_metadata(nn_metadata)
+    92                                           
+    93        10          0.0      0.0      0.0          nn_metadata_copy: Optional[EmbeddingMetadataObj] = (
+    94        10          2.5      0.2      1.7              copy.deepcopy(nn_metadata) if nn_metadata is not None else None
+    95                                                   )
+    96                                           
+    97        10          0.0      0.0      0.0          if self.vcache_config.eviction_policy.ready_to_evict(self.vcache_policy.cache):
+    98                                                       self.vcache_config.eviction_policy.evict(self.vcache_policy.cache)
+    99                                           
+   100        10          0.0      0.0      0.0          if is_cache_hit:
+   101                                                       return is_cache_hit, response, nn_metadata_copy, nn_metadata_copy
+   102                                                   else:
+   103        10          0.0      0.0      0.0              return (
+   104        10          0.0      0.0      0.0                  is_cache_hit,
+   105        10          0.0      0.0      0.0                  response,
+   106        10          0.1      0.0      0.1                  EmbeddingMetadataObj(embedding_id=-1, response=response, id_set=id_set),
+   107        10          0.0      0.0      0.0                  nn_metadata_copy,
+   108                                                       )
+
+Total time: 0.145616 s
+File: /home/ali/vcahce/vcache/vcache_core/cache/cache.py
+Function: Cache.get_knn at line 65
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    65                                               def get_knn(self, prompt: str, k: int) -> List[tuple[float, int]]:
+    66                                                   """Gets k-nearest neighbors for a given prompt.
+    67                                           
+    68                                                   Args:
+    69                                                       prompt (str): The prompt to get the k-nearest neighbors for.
+    70                                                       k (int): The number of nearest neighbors to retrieve.
+    71                                           
+    72                                                   Returns:
+    73                                                       List[tuple[float, int]]: A list of tuples, each containing a
+    74                                                       similarity score and an embedding ID.
+    75                                                   """
+    76        10        143.9     14.4     98.8          embedding = self.embedding_engine.get_embedding(prompt)
+    77        10          1.7      0.2      1.2          return self.embedding_store.get_knn(embedding, k)
+
+Total time: 0.143866 s
+File: /home/ali/vcahce/vcache/vcache_core/cache/embedding_engine/strategies/bge.py
+Function: BGEEmbeddingEngine.get_embedding at line 16
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    16                                               @override
+    17                                               def get_embedding(self, text: str) -> List[float]:
+    18                                                   """
+    19                                                   Get the embedding for the given text using the underlying BGE model.
+    20                                           
+    21                                                   Args:
+    22                                                       text: The text to get the embedding for.
+    23                                           
+    24                                                   Returns:
+    25                                                       The embedding of the text as a list of floats.
+    26                                                   """
+    27                                                   # EmbeddingModel.get_embedding returns a numpy array, we convert to list
+    28        10        143.7     14.4     99.9          embedding = self.embedding_model.get_embedding(text)
+    29        10          0.1      0.0      0.1          return embedding.tolist()
+
+Total time: 0.00160293 s
+File: /home/ali/vcahce/vcache/vcache_core/cache/embedding_store/vector_db/strategies/hnsw_lib.py
+Function: HNSWLibVectorDB.get_knn at line 80
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    80                                               def get_knn(self, embedding: List[float], k: int) -> List[tuple[float, int]]:
+    81                                                   """Gets k-nearest neighbors for a given embedding.
+    82                                           
+    83                                                   Args:
+    84                                                       embedding (List[float]): The query embedding vector.
+    85                                                       k (int): The number of nearest neighbors to return.
+    86                                           
+    87                                                   Returns:
+    88                                                       List[tuple[float, int]]: A list of tuples containing similarity
+    89                                                       scores and embedding IDs.
+    90                                                   """
+    91        10          0.0      0.0      0.7          if self.index is None:
+    92                                                       return []
+    93        10          0.0      0.0      1.3          k_ = min(k, self.embedding_count)
+    94        10          0.0      0.0      0.4          if k_ == 0:
+    95                                                       return []
+    96        10          1.1      0.1     69.2          ids, similarities = self.index.knn_query(embedding, k=k_)
+    97        10          0.1      0.0      3.2          metric_type = self.similarity_metric_type.value
+    98        20          0.3      0.0     19.4          similarity_scores = [
+    99        10          0.0      0.0      1.4              self.transform_similarity_score(sim, metric_type) for sim in similarities[0]
+   100                                                   ]
+   101        10          0.0      0.0      2.7          id_list = [int(id) for id in ids[0]]
+   102        10          0.0      0.0      1.7          return list(zip(similarity_scores, id_list))
+
+Total time: 0.143411 s
+File: /home/ali/vcahce/vcache/vcache_core/splitter/embedding_model.py
+Function: EmbeddingModel.get_embedding at line 86
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    86                                               def get_embedding(self, text):
+    87                                                   """ 获取文本的向量嵌入 """
+    88                                                 
+    89        10          0.4      0.0      0.3          device = next(self.model.parameters()).device
+    90                                               
+    91        10          9.0      0.9      6.3          inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+    92                                                   
+    93        10          2.2      0.2      1.5          inputs = {k: v.to(device) for k, v in inputs.items()}
+    94                                           
+    95        20          0.3      0.0      0.2          with torch.no_grad():
+    96        10        127.9     12.8     89.2              outputs = self.model(**inputs)
+    97                                           
+    98        10          0.0      0.0      0.0          hs = outputs.last_hidden_state  # [1, L, H]
+    99        10          0.0      0.0      0.0          attn = inputs.get("attention_mask", None)
+   100        10          0.0      0.0      0.0          if attn is None:
+   101                                                       pooled = hs.mean(dim=1)
+   102                                                   else:
+   103        10          0.7      0.1      0.5              attn_f = attn.to(dtype=hs.dtype).unsqueeze(-1)
+   104        10          2.1      0.2      1.5              pooled = (hs * attn_f).sum(dim=1) / attn_f.sum(dim=1).clamp_min(1.0)
+   105                                           
+   106        10          0.8      0.1      0.6          return pooled.squeeze().cpu().numpy()
+
+Total time: 0.146699 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified.py
+Function: VerifiedDecisionPolicy.process_request at line 173
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   173                                               @override
+   174                                               def process_request(
+   175                                                   self, prompt: str, system_prompt: Optional[str], id_set: int
+   176                                               ) -> tuple[bool, str, EmbeddingMetadataObj]:
+   177                                                   """
+   178                                                   Process a request using dynamic local threshold policy.
+   179                                           
+   180                                                   It determines whether to serve a cached response or generate a new one.
+   181                                                   If the policy decides to 'explore', it generates a new response and
+   182                                                   triggers an asynchronous background task to evaluate the decision and
+   183                                                   update the cache, without blocking the current request. The functions returns
+   184                                                   the actual response and some metadata information—whether the response is a
+   185                                                   cache hit and the nearest neighbor response—to enable further analysis.
+   186                                           
+   187                                                   Args:
+   188                                                       prompt: The prompt to check for cache hit.
+   189                                                       system_prompt: The optional system prompt to use for the response. It will override the system prompt in the VCacheConfig if provided.
+   190                                                       id_set: The set identifier for the embedding. This is used in the
+   191                                                           benchmark to identify if the nearest neighbor is from the same set
+   192                                                           (if the cached response is correct or incorrect).
+   193                                           
+   194                                                   Returns:
+   195                                                       Tuple containing [is_cache_hit, actual_response, nn_metadata_object].
+   196                                                   """
+   197        10          0.0      0.0      0.0          if self.inference_engine is None or self.cache is None:
+   198                                                       raise ValueError("Policy has not been setup")
+   199                                           
+   200        10        145.7     14.6     99.3          knn = self.cache.get_knn(prompt=prompt, k=1)
+   201        10          0.0      0.0      0.0          if not knn:
+   202                                                       response = self.inference_engine.create(
+   203                                                           prompt=prompt, system_prompt=system_prompt
+   204                                                       )
+   205                                                       self.cache.add(prompt=prompt, response=response, id_set=id_set)
+   206                                                       return False, response, EmbeddingMetadataObj(embedding_id=-1, response="")
+   207                                           
+   208        10          0.0      0.0      0.0          similarity_score, embedding_id = knn[0]
+   209                                           
+   210        10          0.0      0.0      0.0          try:
+   211        20          0.1      0.0      0.0              nn_metadata: EmbeddingMetadataObj = self.cache.get_metadata(
+   212        10          0.0      0.0      0.0                  embedding_id=embedding_id
+   213                                                       )
+   214                                                   except Exception:
+   215                                                       # Cache eviction fallback
+   216                                                       new_response: str = self.inference_engine.create(
+   217                                                           prompt=prompt, system_prompt=system_prompt
+   218                                                       )
+   219                                                       self.cache.add(prompt=prompt, response=new_response, id_set=id_set)
+   220                                                       return (
+   221                                                           False,
+   222                                                           new_response,
+   223                                                           EmbeddingMetadataObj(embedding_id=-1, response=""),
+   224                                                       )
+   225                                           
+   226        20          0.4      0.0      0.3          action = self.bayesian.select_action(
+   227        10          0.0      0.0      0.0              similarity_score=similarity_score, metadata=nn_metadata
+   228                                                   )
+   229                                           
+   230        10          0.0      0.0      0.0          match action:
+   231        10          0.0      0.0      0.0              case _Action.EXPLOIT:
+   232                                                           return True, nn_metadata.response, nn_metadata
+   233        10          0.0      0.0      0.0              case _Action.EXPLORE:
+   234        20          0.0      0.0      0.0                  response = self.inference_engine.create(
+   235        10          0.0      0.0      0.0                      prompt=prompt, system_prompt=system_prompt
+   236                                                           )
+   237                                           
+   238        20          0.4      0.0      0.3                  self.__update_cache(
+   239        10          0.0      0.0      0.0                      response=response,
+   240        10          0.0      0.0      0.0                      nn_metadata=nn_metadata,
+   241        10          0.0      0.0      0.0                      similarity_score=similarity_score,
+   242        10          0.0      0.0      0.0                      embedding_id=embedding_id,
+   243        10          0.0      0.0      0.0                      prompt=prompt,
+   244        10          0.0      0.0      0.0                      label_id_set=id_set,
+   245                                                           )
+   246                                           
+   247        10          0.0      0.0      0.0                  return False, response, nn_metadata
+
+Total time: 0.000337287 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified.py
+Function: _Algorithm.select_action at line 493
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   493                                               def select_action(
+   494                                                   self, similarity_score: float, metadata: EmbeddingMetadataObj
+   495                                               ) -> _Action:
+   496                                                   """
+   497                                                   Select the action to take based on the similarity score, observations, and accuracy target
+   498                                           
+   499                                                   Args
+   500                                                       similarity_score: float - The similarity score between the query and the embedding
+   501                                                       metadata: EmbeddingMetadataObj - The metadata of the embedding
+   502                                                   Returns
+   503                                                       Action - Explore or Exploit
+   504                                                   """
+   505        10          0.2      0.0     60.6          similarity_score = round(similarity_score, 3)
+   506        10          0.1      0.0     22.4          similarities: np.ndarray = np.array([obs[0] for obs in metadata.observations])
+   507        10          0.0      0.0     10.1          labels: np.ndarray = np.array([obs[1] for obs in metadata.observations])
+   508                                           
+   509        10          0.0      0.0      2.9          if len(similarities) < 6 or len(labels) < 6:
+   510        10          0.0      0.0      4.0              return _Action.EXPLORE
+   511                                           
+   512                                                   t_hat, gamma, var_t = self._estimate_parameters(
+   513                                                       similarities=similarities, labels=labels
+   514                                                   )
+   515                                           
+   516                                                   if t_hat == -1:
+   517                                                       return _Action.EXPLORE
+   518                                                   metadata.gamma = gamma
+   519                                                   metadata.t_hat = t_hat
+   520                                                   metadata.var_t = var_t
+   521                                           
+   522                                                   start_time = time.time()
+   523                                                   tau: float = self._get_tau(
+   524                                                       var_t=var_t, s=similarity_score, t_hat=t_hat, metadata=metadata
+   525                                                   )
+   526                                                   latency = time.time() - start_time
+   527                                           
+   528                                                   # Uncomment this to save the tau latencies to a CSV file
+   529                                                   self.tau_latencies.append(latency)
+   530                                                   # if len(self.tau_latencies) % 10000 == 0:
+   531                                                   #    df = pd.DataFrame(self.tau_latencies, columns=['latency'])
+   532                                                   #    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+   533                                                   #    print(f"Saving tau latencies to CSV: tau_latencies_{timestamp}.csv (First value: {self.tau_latencies[0]:.5f}s)")
+   534                                                   #    df.to_csv(f'tau_latencies_{timestamp}.csv', index=False)
+   535                                           
+   536                                                   u: float = random.uniform(0, 1)
+   537                                                   if u <= tau:
+   538                                                       return _Action.EXPLORE
+   539                                                   else:
+   540                                                       return _Action.EXPLOIT
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified.py
+Function: _Algorithm._estimate_parameters at line 542
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   542                                               def _estimate_parameters(
+   543                                                   self, similarities: np.ndarray, labels: np.ndarray
+   544                                               ) -> Tuple[float, float, float]:
+   545                                                   """
+   546                                                   Optimize parameters with logistic regression
+   547                                           
+   548                                                   Args
+   549                                                       similarities: np.ndarray - The similarities of the embeddings
+   550                                                       labels: np.ndarray - The labels of the embeddings
+   551                                                       metadata: EmbeddingMetadataObj - The metadata of the embedding
+   552                                           
+   553                                                   Returns
+   554                                                       t_hat: float - The estimated threshold
+   555                                                       gamma: float - The estimated gamma
+   556                                                       var_t: float - The estimated variance of t
+   557                                                   """
+   558                                           
+   559                                                   similarities = sm.add_constant(similarities)
+   560                                           
+   561                                                   try:
+   562                                                       if len(similarities) != len(labels):
+   563                                                           print(f"len does not match: {len(similarities)} != {len(labels)}")
+   564                                                       self.logistic_regression.fit(similarities, labels)
+   565                                                       intercept, gamma = self.logistic_regression.coef_[0]
+   566                                           
+   567                                                       gamma = max(gamma, 1e-6)
+   568                                                       t_hat = -intercept / gamma
+   569                                                       t_hat = float(np.clip(t_hat, 0.0, 1.0))
+   570                                           
+   571                                                       similarities_col = (
+   572                                                           similarities[:, 1] if similarities.shape[1] > 1 else similarities[:, 0]
+   573                                                       )
+   574                                                       perfect_seperation = np.min(similarities_col[labels == 1]) > np.max(
+   575                                                           similarities_col[labels == 0]
+   576                                                       )
+   577                                                       var_t = self._get_var_t(
+   578                                                           perfect_seperation=perfect_seperation,
+   579                                                           n_observations=len(similarities),
+   580                                                           X=similarities,
+   581                                                           gamma=gamma,
+   582                                                           intercept=intercept,
+   583                                                       )
+   584                                           
+   585                                                       return round(t_hat, 3), round(gamma, 3), var_t
+   586                                           
+   587                                                   except Exception as e:
+   588                                                       print(f"Logistic regression failed: {e}")
+   589                                                       return -1.0, -1.0, -1.0
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified.py
+Function: _Algorithm._get_var_t at line 591
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   591                                               def _get_var_t(
+   592                                                   self,
+   593                                                   perfect_seperation: bool,
+   594                                                   n_observations: int,
+   595                                                   X: np.ndarray,
+   596                                                   gamma: float,
+   597                                                   intercept: float,
+   598                                               ) -> float:
+   599                                                   """
+   600                                                   Compute the variance of t using the delta method
+   601                                           
+   602                                                   Args
+   603                                                       perfect_seperation: bool - Whether the data is perfectly separable
+   604                                                       n_observations: int - The number of observations
+   605                                                       X: np.ndarray - The design matrix
+   606                                                       gamma: float - The gamma parameter
+   607                                                       intercept: float - The intercept parameter
+   608                                           
+   609                                                   Returns
+   610                                                       float - The variance of t
+   611                                           
+   612                                                   Note:
+   613                                                       If the data is perfectly separable, we use the variance map to estimate the variance of t
+   614                                                       Otherwise, we use the delta method to estimate the variance of t
+   615                                                   """
+   616                                                   if perfect_seperation:
+   617                                                       if n_observations in self.variance_map:
+   618                                                           var_t = self.variance_map[n_observations]
+   619                                                       else:
+   620                                                           max_observations = max(self.variance_map.keys())
+   621                                                           var_t = self.variance_map[max_observations]
+   622                                                       return var_t
+   623                                                   else:
+   624                                                       p = self.logistic_regression.predict_proba(X)[:, 1]
+   625                                                       W = p * (1 - p)
+   626                                                       H = X.T @ (W[:, None] * X)
+   627                                           
+   628                                                       cov_beta = np.linalg.inv(H)
+   629                                           
+   630                                                       grad = np.array([-1.0 / gamma, intercept / (gamma**2)])
+   631                                           
+   632                                                       var_t_hat = float(grad @ cov_beta @ grad)
+   633                                                       var_t_hat = max(0.0, var_t_hat)
+   634                                                       return var_t_hat
+
+Total time: 0 s
+File: /home/ali/vcahce/vcache/vcache_policy/strategies/verified.py
+Function: _Algorithm._get_tau at line 636
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   636                                               def _get_tau(
+   637                                                   self,
+   638                                                   var_t: float,
+   639                                                   s: float,
+   640                                                   t_hat: float,
+   641                                                   metadata: EmbeddingMetadataObj,
+   642                                               ) -> float:
+   643                                                   """
+   644                                                   Find the minimum tau value for the given similarity score
+   645                                           
+   646                                                   Args
+   647                                                       var_t: float - The variance of t
+   648                                                       s: float - The similarity score between the query and the nearest neighbor
+   649                                                       t_hat: float - The estimated threshold
+   650                                                       metadata: EmbeddingMetadataObj - The metadata of the nearest neighbor
+   651                                           
+   652                                                   Returns
+   653                                                       float - The minimum tau value
+   654                                                   """
+   655                                                   t_primes: List[float] = self._get_t_primes(t_hat=t_hat, var_t=var_t)
+   656                                                   likelihoods = self._likelihood(s=s, t=t_primes, gamma=metadata.gamma)
+   657                                                   alpha_lower_bounds = (1 - self.epsilon_grid) * likelihoods
+   658                                           
+   659                                                   taus = 1 - (1 - self.P_c) / (1 - alpha_lower_bounds)
+   660                                                   metadata.t_prime = t_primes[np.argmin(taus)]
+   661                                                   return round(np.min(taus), 5)
+

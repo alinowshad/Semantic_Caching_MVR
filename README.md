@@ -98,7 +98,7 @@ poetry run python benchmarks/eval_sembenchmark_verified_splitter.py \
   --llm-col response_llama_3_8b \
   --deltas 0.01 0.015 0.02 0.03 0.05 0.07 0.08 \
   --candidate-selection multivector_top_k \
-  --candidate-k 5 10 \
+  --candidate-ks 5 10 \
   --splitter-checkpoint ~/checkpoints_words/epoch=29-step=1620.ckpt \
   --splitter-device cuda:3 \
   --similarity-evaluator string \

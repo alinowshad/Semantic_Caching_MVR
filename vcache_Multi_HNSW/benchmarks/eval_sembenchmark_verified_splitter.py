@@ -18,11 +18,32 @@ Usage (example):
     --llm-col response_llama_3_8b \
     --splitter-checkpoint /path/to/ckpt_or_dir \
     --delta 0.02
+poetry run python benchmarks/eval_sembenchmark_verified_splitter.py \
+  --dataset /home/zhengzishan/Semantic_Caching_MVR/vcahce/datasets/filtered_sembenchmark_train.csv \
+  --llm-col response_llama_3_8b \
+  --deltas 0.01 0.015 0.02 0.03 0.05 0.07 0.08 \
+  --candidate-selection multivector_top_k \
+  --candidate-k 10 \
+  --splitter-checkpoint ~/checkpoints_words/epoch=29-step=1620.ckpt \
+  --splitter-device cuda:3 \
+  --similarity-evaluator string \
+  --sleep 0.1 \
+  --output-json results/local_verified_splitter.json \
+  --benchmark-output-dir results/benchmark_compat \
+  --benchmark-run-index 1
+  env:
+
+zhengzishan@user-Super-Server:~/Semantic_Caching_MVR/vcache_Multi_HNSW$ poetry run python -m pip uninstall -y chroma-hnswlib
+Found existing installation: chroma-hnswlib 0.7.6
+Uninstalling chroma-hnswlib-0.7.6:
+  Successfully uninstalled chroma-hnswlib-0.7.6
+zhengzishan@user-Super-Server:~/Semantic_Caching_MVR/vcache_Multi_HNSW$ poetry run python -m pip install -e vcache/vcache_core/cache/embedding_store/hnswlib
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 import time
@@ -30,6 +51,7 @@ import warnings
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
@@ -42,6 +64,9 @@ from vcache.vcache_core.cache.embedding_engine.strategies.bge import (
 )
 from vcache.vcache_core.cache.embedding_store.embedding_metadata_storage import (
     InMemoryEmbeddingMetadataStorage,
+)
+from vcache.vcache_core.cache.embedding_store.embedding_metadata_storage.embedding_metadata_obj import (
+    EmbeddingMetadataObj,
 )
 from vcache.vcache_core.cache.embedding_store.vector_db import (
     HNSWLibVectorDB,
@@ -171,6 +196,13 @@ def main() -> None:
     )
     parser.add_argument("--delta", type=float, default=0.02)
     parser.add_argument(
+        "--deltas",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Optional list of deltas to run (overrides --delta). Example: --deltas 0.015 0.02 0.03",
+    )
+    parser.add_argument(
         "--similarity-evaluator",
         choices=["benchmark_id_set", "string"],
         default="benchmark_id_set",
@@ -202,6 +234,13 @@ def main() -> None:
         "(then union parent IDs).",
     )
     parser.add_argument(
+        "--candidate-ks",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional list of candidate-k values to run (overrides --candidate-k). Example: --candidate-ks 5 10 15",
+    )
+    parser.add_argument(
         "--use-cached-candidate-segments",
         action="store_true",
         help="Cache candidate MaxSim segment tensors in metadata and only segment the query at request time.",
@@ -229,155 +268,513 @@ def main() -> None:
         default=None,
         help="Path to save per-sample results for curve plotting.",
     )
+    parser.add_argument(
+        "--benchmark-output-dir",
+        type=str,
+        default=None,
+        help="If set, write benchmark.py-compatible outputs under this directory (creates vcache_splitter_*_run_* folders with results_<timestamp>.json).",
+    )
+    parser.add_argument(
+        "--benchmark-run-index",
+        type=int,
+        default=1,
+        help="run index used in vcache_splitter_*_run_<idx> folder naming when --benchmark-output-dir is set.",
+    )
+    parser.add_argument(
+        "--benchmark-timestamp",
+        type=str,
+        default=None,
+        help="Timestamp string used in results_<timestamp>.json when --benchmark-output-dir is set. Default matches benchmark.py format: YYYY-MM-DD_HH-MM",
+    )
     args = parser.parse_args()
 
     # Mirror: must be set before importing HF libs in a fresh process.
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-    cache_paths = _ensure_hf_cache_env(args.hf_cache_base)
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+    dataset_is_local_file = False
+    try:
+        dataset_is_local_file = os.path.exists(str(args.dataset))
+    except Exception:
+        dataset_is_local_file = False
+    if str(args.dataset).endswith(".csv") or str(args.dataset).endswith(".parquet"):
+        dataset_is_local_file = True
 
-    # Load dataset
-    split = "train"
-    if args.max_samples is not None:
-        split = f"train[:{args.max_samples}]"
+    if dataset_is_local_file:
+        dataset_path = os.path.abspath(str(args.dataset))
+        if dataset_path.endswith(".csv"):
+            try:
+                df = pd.read_csv(dataset_path)
+            except Exception:
+                df = pd.read_csv(
+                    dataset_path,
+                    engine="python",
+                    on_bad_lines="skip",
+                    low_memory=False,
+                )
+        elif dataset_path.endswith(".parquet"):
+            df = pd.read_parquet(dataset_path)
+        else:
+            raise ValueError(
+                f"Unsupported local dataset file format: {dataset_path} (expected .csv or .parquet)"
+            )
 
-    rows = load_dataset(
-        args.dataset,
-        split=split,
-        cache_dir=cache_paths["DATASETS_CACHE"],
-        token=hf_token,
+        if "prompt" not in df.columns:
+            raise ValueError(
+                f"Local dataset is missing required column 'prompt'. Available columns: {list(df.columns)}"
+            )
+        if args.llm_col not in df.columns:
+            raise ValueError(
+                f"Local dataset is missing required LLM response column '{args.llm_col}'. Available columns: {list(df.columns)}"
+            )
+
+        id_col = None
+        if "ID_Set" in df.columns:
+            id_col = "ID_Set"
+        elif "id_set" in df.columns:
+            id_col = "id_set"
+
+        if args.similarity_evaluator == "benchmark_id_set":
+            has_usable_ids = False
+            if id_col is not None:
+                try:
+                    s = pd.to_numeric(df[id_col], errors="coerce").fillna(-1)
+                    has_usable_ids = bool((s.astype(int) != -1).any())
+                except Exception:
+                    has_usable_ids = False
+            if not has_usable_ids:
+                args.similarity_evaluator = "string"
+
+        rows = df.to_dict("records")
+        if args.max_samples is not None:
+            rows = rows[: int(args.max_samples)]
+    else:
+        cache_paths = _ensure_hf_cache_env(args.hf_cache_base)
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+
+        # Load dataset
+        split = "train"
+        if args.max_samples is not None:
+            split = f"train[:{args.max_samples}]"
+
+        rows = load_dataset(
+            args.dataset,
+            split=split,
+            cache_dir=cache_paths["DATASETS_CACHE"],
+            token=hf_token,
+        )
+
+    deltas = (
+        list(args.deltas)
+        if args.deltas is not None and len(args.deltas) > 0
+        else [float(args.delta)]
     )
+    if str(args.candidate_selection) == "all":
+        candidate_ks = [-1]
+    else:
+        candidate_ks = (
+            list(args.candidate_ks)
+            if args.candidate_ks is not None and len(args.candidate_ks) > 0
+            else [int(args.candidate_k)]
+        )
+    run_grid = [(float(d), int(k)) for d in deltas for k in candidate_ks]
 
-    # Build vCache with benchmark engines (offline eval)
-    inference_engine = BenchmarkInferenceEngine()
-    
-    # Use a single shared embedder for both the vector DB and the splitter
     shared_embedder = EmbeddingModel(device=args.splitter_device)
     embedding_engine = BGEEmbeddingEngine(embedding_model=shared_embedder)
+    splitter = MaxSimSplitter(
+        checkpoint_path=args.splitter_checkpoint,
+        device=args.splitter_device,
+        embedding_model=shared_embedder,
+    )
 
     if args.similarity_evaluator == "string":
         similarity_evaluator = StringComparisonSimilarityEvaluator()
     else:
         similarity_evaluator = BenchmarkComparisonSimilarityEvaluator()
 
-    config = VCacheConfig(
-        embedding_engine=embedding_engine,
-        inference_engine=inference_engine,
-        embedding_metadata_storage=InMemoryEmbeddingMetadataStorage(),
-        eviction_policy=NoEvictionPolicy(),
-        similarity_evaluator=similarity_evaluator,
+    def _resolve_output_path(*, delta: float, candidate_k: int) -> str | None:
+        if not args.output_json:
+            return None
+        base = str(args.output_json)
+        if len(run_grid) <= 1:
+            return base
+
+        base_abs = os.path.abspath(base)
+        if base_abs.endswith(os.sep) or os.path.isdir(base_abs):
+            os.makedirs(base_abs, exist_ok=True)
+            name = f"verified_splitter_delta{delta}_k{candidate_k}.json"
+            return os.path.join(base_abs, name)
+
+        root, ext = os.path.splitext(base)
+        ext = ext if ext else ".json"
+        return f"{root}_delta{delta}_k{candidate_k}{ext}"
+
+    benchmark_timestamp = args.benchmark_timestamp or datetime.now().strftime(
+        "%Y-%m-%d_%H-%M"
     )
 
-    splitter = MaxSimSplitter(
-        checkpoint_path=args.splitter_checkpoint,
-        device=args.splitter_device,
-        embedding_model=shared_embedder,
-    )
-    policy = VerifiedSplitterDecisionPolicy(
-        delta=args.delta,
-        splitter=splitter,
-        device=args.splitter_device,
-        candidate_selection=args.candidate_selection,
-        candidate_k=args.candidate_k,
-        use_cached_candidate_segments=bool(args.use_cached_candidate_segments),
-        multivector_max_elements=int(args.multivector_max_elements),
-    )
-    vcache = VCache(config=config, policy=policy)
+    def _resolve_benchmark_output_dir(*, delta: float, candidate_k: int) -> str | None:
+        if not args.benchmark_output_dir:
+            return None
 
-    hits = 0
-    tp = fp = tn = fn = 0
-    n = 0
-    per_sample_results = []
+        base_dir = os.path.abspath(str(args.benchmark_output_dir))
+        os.makedirs(base_dir, exist_ok=True)
 
-    t0 = time.time()
-    pbar = tqdm(rows, desc="Evaluating (Splitter)", unit="samples")
-    for r in pbar:
-        prompt = r["prompt"]
-        system_prompt = r.get("output_format", "") or ""
-        id_set = _get_id_set(r)
+        candidate_k_label = "all" if int(candidate_k) == -1 else str(int(candidate_k))
+        sel_for_dir = "all" if str(args.candidate_selection) == "all" else "top_k"
+        dir_name = f"vcache_splitter_{delta}_{sel_for_dir}_{candidate_k_label}_run_{int(args.benchmark_run_index)}"
+        out_dir = os.path.join(base_dir, dir_name)
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
 
-        label_response = r[args.llm_col]
+    def _compute_statistics_json(
+        *,
+        cache_hit_list: list[int],
+        cache_miss_list: list[int],
+        tp_list: list[int],
+        fp_list: list[int],
+        tn_list: list[int],
+        fn_list: list[int],
+        latency_direct_list: list[float],
+        latency_vectorq_list: list[float],
+    ) -> Dict[str, Any]:
+        n = int(len(latency_vectorq_list))
+        avg_latency_vcache_overall = float(sum(latency_vectorq_list) / n) if n > 0 else 0.0
+        avg_latency_direct_overall = float(sum(latency_direct_list) / n) if n > 0 else 0.0
 
-        # Inject ground truth response for the benchmark engine
-        inference_engine.set_next_response(label_response)
+        hit_latencies_v = [latency_vectorq_list[i] for i in range(n) if int(cache_hit_list[i]) > 0]
+        miss_latencies_v = [latency_vectorq_list[i] for i in range(n) if int(cache_miss_list[i]) > 0]
+        hit_latencies_d = [latency_direct_list[i] for i in range(n) if int(cache_hit_list[i]) > 0]
+        miss_latencies_d = [latency_direct_list[i] for i in range(n) if int(cache_miss_list[i]) > 0]
 
-        is_hit, resp, resp_meta, nn_meta = vcache.infer_with_cache_info(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            id_set=id_set,
+        avg_latency_vcache_cache_hit = (
+            float(sum(hit_latencies_v) / len(hit_latencies_v)) if hit_latencies_v else 0.0
+        )
+        avg_latency_vcache_cache_miss = (
+            float(sum(miss_latencies_v) / len(miss_latencies_v)) if miss_latencies_v else 0.0
+        )
+        avg_latency_direct_cache_hit = (
+            float(sum(hit_latencies_d) / len(hit_latencies_d)) if hit_latencies_d else 0.0
+        )
+        avg_latency_direct_cache_miss = (
+            float(sum(miss_latencies_d) / len(miss_latencies_d)) if miss_latencies_d else 0.0
         )
 
-        n += 1
-        hits += int(is_hit)
-        d_tp, d_fp, d_tn, d_fn = _score_step(
-            is_cache_hit=is_hit,
-            label_id_set=id_set,
-            label_response=label_response,
-            cache_response=resp,
-            response_metadata=resp_meta,
-            nn_metadata=nn_meta,
+        cache_hit_rate_vcache = float(sum(cache_hit_list) / n) if n > 0 else 0.0
+        cache_miss_rate_vcache = 1.0 - cache_hit_rate_vcache
+        error_rate_vcache = float(sum(fp_list) / n) if n > 0 else 0.0
+
+        duration_vcache = float(sum(latency_vectorq_list))
+        duration_direct = float(sum(latency_direct_list))
+
+        tp_sum = int(sum(tp_list))
+        fp_sum = int(sum(fp_list))
+        tn_sum = int(sum(tn_list))
+        fn_sum = int(sum(fn_list))
+
+        accuracy_vcache = float((tp_sum + tn_sum) / n) if n > 0 else 0.0
+        precision_vcache = (
+            float(tp_sum / (tp_sum + fp_sum)) if (tp_sum + fp_sum) > 0 else 0.0
         )
-        tp += d_tp
-        fp += d_fp
-        tn += d_tn
-        fn += d_fn
+        recall_vcache = float(tp_sum / (tp_sum + fn_sum)) if (tp_sum + fn_sum) > 0 else 0.0
+        f1_score_vcache = (
+            float(2 * precision_vcache * recall_vcache / (precision_vcache + recall_vcache))
+            if (precision_vcache + recall_vcache) > 0
+            else 0.0
+        )
 
-        # Track per-sample result
-        per_sample_results.append({
-            "sample_index": n,
-            "is_hit": is_hit,
-            "running_hit_rate": hits / n,
-            "tp": d_tp,
-            "fp": d_fp,
-            "tn": d_tn,
-            "fn": d_fn
-        })
+        hits_last = int(cache_hit_list[-1]) if cache_hit_list else 0
+        misses_last = int(cache_miss_list[-1]) if cache_miss_list else 0
 
-        # Update progress bar stats
-        pbar.set_postfix({
-            "hits": f"{hits}/{n}",
-            "hit_rate": f"{(hits/n):.1%}"
-        })
-
-        if args.sleep and args.sleep > 0:
-            time.sleep(float(args.sleep))
-
-    elapsed = time.time() - t0
-
-    print(f"dataset={args.dataset}")
-    print(f"columns: embedding={args.embedding_col} llm={args.llm_col}")
-    print(f"delta={args.delta} n={n} time={elapsed:.2f}s")
-    print(f"candidate_selection={args.candidate_selection} candidate_k={args.candidate_k}")
-    print(f"hit_rate={hits}/{n} ({(hits/max(1,n)):.1%})")
-    print(f"tp={tp} fp={fp} tn={tn} fn={fn}")
-
-    if args.output_json:
-        # Ensure parent directory exists (e.g., "results/...")
-        out_dir = os.path.dirname(os.path.abspath(args.output_json))
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        output_data = {
-            "args": vars(args),
-            "summary": {
-                "n": n,
-                "hits": hits,
-                "hit_rate": hits / max(1, n),
-                "tp": tp,
-                "fp": fp,
-                "tn": tn,
-                "fn": fn,
-                "total_time": elapsed
+        return {
+            "avg_latency": {
+                "cache": {
+                    "overall": float(avg_latency_vcache_overall),
+                    "cache_hit": float(avg_latency_vcache_cache_hit),
+                    "cache_miss": float(avg_latency_vcache_cache_miss),
+                },
+                "direct": {"overall": float(avg_latency_direct_overall)},
+                "difference": {
+                    "overall": float(avg_latency_direct_overall - avg_latency_vcache_overall),
+                    "cache_hit": float(avg_latency_direct_cache_hit - avg_latency_vcache_cache_hit),
+                    "cache_miss": float(avg_latency_direct_cache_miss - avg_latency_vcache_cache_miss),
+                },
+                "ratio": {
+                    "overall": float(avg_latency_direct_overall / avg_latency_vcache_overall)
+                    if avg_latency_vcache_overall > 0
+                    else "N/A",
+                    "cache_hit": float(avg_latency_direct_cache_hit / avg_latency_vcache_cache_hit)
+                    if avg_latency_vcache_cache_hit > 0
+                    else "N/A",
+                    "cache_miss": float(avg_latency_direct_cache_miss / avg_latency_vcache_cache_miss)
+                    if avg_latency_vcache_cache_miss > 0
+                    else "N/A",
+                },
             },
-            "per_sample": per_sample_results
+            "cache": {
+                "hit_rate": float(cache_hit_rate_vcache),
+                "miss_rate": float(cache_miss_rate_vcache),
+                "total_samples": int(n),
+                "hits": int(hits_last),
+                "misses": int(misses_last),
+                "error_rate": float(error_rate_vcache),
+            },
+            "duration": {
+                "vectorq": float(duration_vcache),
+                "direct": float(duration_direct),
+            },
+            "statistics": {
+                "accuracy": float(accuracy_vcache),
+                "precision": float(precision_vcache),
+                "recall": float(recall_vcache),
+                "f1_score": float(f1_score_vcache),
+            },
         }
-        with open(args.output_json, "w") as f:
-            json.dump(output_data, f, indent=2)
-        print(f"Results saved to {args.output_json}")
 
-    # Clean shutdown (VerifiedSplitterDecisionPolicy uses background threads)
-    time.sleep(0.1)
-    vcache.vcache_policy.shutdown()
+    all_summaries: list[dict] = []
+
+    for run_i, (delta, candidate_k) in enumerate(run_grid, start=1):
+        inference_engine = BenchmarkInferenceEngine()
+        config = VCacheConfig(
+            embedding_engine=embedding_engine,
+            inference_engine=inference_engine,
+            vector_db=HNSWLibVectorDB(
+                similarity_metric_type=SimilarityMetricType.COSINE,
+                max_capacity=int(args.max_capacity),
+            ),
+            embedding_metadata_storage=InMemoryEmbeddingMetadataStorage(),
+            eviction_policy=NoEvictionPolicy(),
+            similarity_evaluator=similarity_evaluator,
+        )
+
+        policy = VerifiedSplitterDecisionPolicy(
+            delta=float(delta),
+            splitter=splitter,
+            device=args.splitter_device,
+            candidate_selection=args.candidate_selection,
+            candidate_k=int(candidate_k),
+            use_cached_candidate_segments=bool(args.use_cached_candidate_segments),
+            multivector_max_elements=int(args.multivector_max_elements),
+        )
+        vcache = VCache(config=config, policy=policy)
+
+        hits = 0
+        tp = fp = tn = fn = 0
+        n = 0
+        per_sample_results: list[dict] = []
+
+        cache_hit_list: list[int] = []
+        cache_miss_list: list[int] = []
+        tp_list: list[int] = []
+        fp_list: list[int] = []
+        tn_list: list[int] = []
+        fn_list: list[int] = []
+        latency_direct_list: list[float] = []
+        latency_vectorq_list: list[float] = []
+
+        t0 = time.time()
+        pbar = tqdm(
+            rows,
+            desc=f"Evaluating (Splitter) run={run_i}/{len(run_grid)} delta={delta} k={candidate_k}",
+            unit="samples",
+        )
+        for r in pbar:
+            prompt = r["prompt"]
+            system_prompt = r.get("output_format", "") or ""
+            id_set = _get_id_set(r)
+
+            label_response = r[args.llm_col]
+            inference_engine.set_next_response(label_response)
+
+            step_t0 = time.time()
+            is_hit, resp, resp_meta, nn_meta = vcache.infer_with_cache_info(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                id_set=id_set,
+            )
+            step_latency = time.time() - step_t0
+
+            n += 1
+            hits += int(is_hit)
+            d_tp, d_fp, d_tn, d_fn = _score_step(
+                is_cache_hit=is_hit,
+                label_id_set=id_set,
+                label_response=label_response,
+                cache_response=resp,
+                response_metadata=resp_meta,
+                nn_metadata=nn_meta,
+            )
+            tp += d_tp
+            fp += d_fp
+            tn += d_tn
+            fn += d_fn
+
+            cache_hit_list.append(int(bool(is_hit)))
+            cache_miss_list.append(int(not bool(is_hit)))
+            tp_list.append(int(d_tp))
+            fp_list.append(int(d_fp))
+            tn_list.append(int(d_tn))
+            fn_list.append(int(d_fn))
+            latency_direct_list.append(float(step_latency))
+            latency_vectorq_list.append(float(step_latency))
+
+            per_sample_results.append(
+                {
+                    "sample_index": n,
+                    "is_hit": is_hit,
+                    "running_hit_rate": hits / n,
+                    "tp": d_tp,
+                    "fp": d_fp,
+                    "tn": d_tn,
+                    "fn": d_fn,
+                }
+            )
+
+            pbar.set_postfix({"hits": f"{hits}/{n}", "hit_rate": f"{(hits/n):.1%}"})
+
+            if args.sleep and args.sleep > 0:
+                time.sleep(float(args.sleep))
+
+        elapsed = time.time() - t0
+
+        print(f"dataset={args.dataset}")
+        print(f"columns: embedding={args.embedding_col} llm={args.llm_col}")
+        print(f"delta={delta} n={n} time={elapsed:.2f}s")
+        print(f"candidate_selection={args.candidate_selection} candidate_k={candidate_k}")
+        print(f"hit_rate={hits}/{n} ({(hits/max(1,n)):.1%})")
+        print(f"tp={tp} fp={fp} tn={tn} fn={fn}")
+
+        summary = {
+            "delta": float(delta),
+            "candidate_k": int(candidate_k),
+            "candidate_selection": str(args.candidate_selection),
+            "n": n,
+            "hits": hits,
+            "hit_rate": hits / max(1, n),
+            "tp": tp,
+            "fp": fp,
+            "tn": tn,
+            "fn": fn,
+            "total_time": elapsed,
+        }
+        all_summaries.append(summary)
+
+        out_path = _resolve_output_path(delta=float(delta), candidate_k=int(candidate_k))
+        if out_path:
+            out_dir = os.path.dirname(os.path.abspath(out_path))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            output_data = {"args": vars(args), "summary": summary, "per_sample": per_sample_results}
+            with open(out_path, "w") as f:
+                json.dump(output_data, f, indent=2)
+            print(f"Results saved to {out_path}")
+
+        bench_dir = _resolve_benchmark_output_dir(delta=float(delta), candidate_k=int(candidate_k))
+        if bench_dir:
+            observations_dict: Dict[str, Dict[str, float]] = {}
+            gammas_dict: Dict[str, float] = {}
+            t_hats_dict: Dict[str, float] = {}
+            t_primes_dict: Dict[str, float] = {}
+            var_ts_dict: Dict[str, float] = {}
+
+            try:
+                metadata_objects: List[EmbeddingMetadataObj] = (
+                    vcache.vcache_config.embedding_metadata_storage.get_all_embedding_metadata_objects()
+                )
+            except Exception:
+                metadata_objects = []
+
+            for metadata_object in metadata_objects:
+                try:
+                    embedding_id = str(metadata_object.embedding_id)
+                except Exception:
+                    continue
+                observations_dict[embedding_id] = getattr(metadata_object, "observations", {})
+                gammas_dict[embedding_id] = getattr(metadata_object, "gamma", None)
+                t_hats_dict[embedding_id] = getattr(metadata_object, "t_hat", None)
+                t_primes_dict[embedding_id] = getattr(metadata_object, "t_prime", None)
+                var_ts_dict[embedding_id] = getattr(metadata_object, "var_t", None)
+
+            try:
+                global_observations_dict = vcache.vcache_policy.global_observations
+                global_gamma = vcache.vcache_policy.bayesian.global_gamma
+                global_t_hat = vcache.vcache_policy.bayesian.global_t_hat
+                global_t_prime = vcache.vcache_policy.bayesian.global_t_prime
+                global_var_t = vcache.vcache_policy.bayesian.global_var_t
+            except Exception:
+                global_observations_dict = {}
+                global_gamma = None
+                global_t_hat = None
+                global_t_prime = None
+                global_var_t = None
+
+            candidate_k_label = "all" if int(candidate_k) == -1 else str(int(candidate_k))
+            bench_data: Dict[str, Any] = {
+                "config": {
+                    "filepath": str(args.dataset),
+                    "embedding_model": str(args.embedding_col or ""),
+                    "llm_model": str(args.llm_col),
+                    "eviction_policy": str(NoEvictionPolicy()),
+                    "is_static_threshold": False,
+                    "threshold": None,
+                    "delta": float(delta),
+                    "splitter_candidate_selection": str(args.candidate_selection),
+                    "splitter_candidate_k": (None if int(candidate_k) == -1 else int(candidate_k)),
+                    "splitter_use_cached_candidate_segments": bool(args.use_cached_candidate_segments),
+                    "splitter_device": str(args.splitter_device),
+                    "splitter_checkpoint": str(args.splitter_checkpoint),
+                },
+                "cache_hit_list": cache_hit_list,
+                "cache_miss_list": cache_miss_list,
+                "tp_list": tp_list,
+                "fp_list": fp_list,
+                "tn_list": tn_list,
+                "fn_list": fn_list,
+                "latency_direct_list": latency_direct_list,
+                "latency_vectorq_list": latency_vectorq_list,
+                "observations_dict": observations_dict,
+                "gammas_dict": gammas_dict,
+                "t_hats_dict": t_hats_dict,
+                "t_primes_dict": t_primes_dict,
+                "var_ts_dict": var_ts_dict,
+                "global_observations_dict": global_observations_dict,
+                "global_gamma": global_gamma,
+                "global_t_hat": global_t_hat,
+                "global_t_prime": global_t_prime,
+                "global_var_t": global_var_t,
+            }
+
+            bench_path = os.path.join(bench_dir, f"results_{benchmark_timestamp}.json")
+            with open(bench_path, "w") as f:
+                json.dump(bench_data, f, indent=4)
+            print(f"Benchmark-format results saved to {bench_path}")
+
+            statistics_path = os.path.join(
+                bench_dir, f"statistics_{benchmark_timestamp}.json"
+            )
+            statistics_data = _compute_statistics_json(
+                cache_hit_list=cache_hit_list,
+                cache_miss_list=cache_miss_list,
+                tp_list=tp_list,
+                fp_list=fp_list,
+                tn_list=tn_list,
+                fn_list=fn_list,
+                latency_direct_list=latency_direct_list,
+                latency_vectorq_list=latency_vectorq_list,
+            )
+            with open(statistics_path, "w") as f:
+                json.dump(statistics_data, f, indent=4)
+            print(f"Benchmark-format statistics saved to {statistics_path}")
+
+        time.sleep(0.1)
+        vcache.vcache_policy.shutdown()
+
+    if len(all_summaries) > 1:
+        print("\nAll runs summary:")
+        for s in all_summaries:
+            print(
+                f"delta={s['delta']} k={s['candidate_k']} hit_rate={s['hits']}/{s['n']} ({s['hit_rate']:.1%}) "
+                f"tp={s['tp']} fp={s['fp']} tn={s['tn']} fn={s['fn']} time={s['total_time']:.2f}s"
+            )
 
 
 if __name__ == "__main__":

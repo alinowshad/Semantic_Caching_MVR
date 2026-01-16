@@ -18,6 +18,8 @@ Usage (example):
     --llm-col response_llama_3_8b \
     --splitter-checkpoint /path/to/ckpt_or_dir \
     --delta 0.02
+    
+    poetry run python benchmarks/eval_sembenchmark_verified_splitter.py --dataset-csv /datasets/filtered_sembenchmark_train.csv --llm-col response_llama_3_8b --delta 0.02 --similarity-evaluator string --sleep 0.1 --splitter-checkpoint ~/checkpoints_words/epoch=29-step=1620.ckpt --candidate-selection top_k --candidate-k 10 --splitter-device cuda --use-cached-candidate-segments --output-json results/verified_splitter_cuda_cachedcandsegments.json
 """
 
 from __future__ import annotations
@@ -25,11 +27,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 import warnings
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
@@ -39,6 +43,9 @@ from vcache.config import VCacheConfig
 from vcache.main import VCache
 from vcache.vcache_core.cache.embedding_engine.strategies.bge import (
     BGEEmbeddingEngine,
+)
+from vcache.vcache_core.cache.embedding_engine.strategies.benchmark import (
+    BenchmarkEmbeddingEngine,
 )
 from vcache.vcache_core.cache.embedding_store.embedding_metadata_storage import (
     InMemoryEmbeddingMetadataStorage,
@@ -64,6 +71,12 @@ from vcache.vcache_policy.strategies.verified_splitter import VerifiedSplitterDe
 warnings.filterwarnings(
     "ignore",
     message=".*'penalty' was deprecated.*",
+    category=FutureWarning,
+)
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*encoder_attention_mask.*deprecated.*",
     category=FutureWarning,
 )
 
@@ -99,13 +112,32 @@ def _ensure_hf_cache_env(hf_cache_base: str | None = None) -> Dict[str, str]:
 
 
 def _get_id_set(row: Dict[str, Any]) -> int:
-    v = row.get("id_set", -1)
-    if v == -1:
-        v = row.get("ID_Set", -1)
+    v = row.get("ID_Set", -1)
+   
     try:
         return int(v)
     except Exception:
         return -1
+
+
+def _parse_embedding(value: Any) -> List[float]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            import ast
+
+            value = ast.literal_eval(value)
+
+    if isinstance(value, torch.Tensor):
+        value = value.tolist()
+    elif isinstance(value, np.ndarray):
+        value = value.tolist()
+
+    if not isinstance(value, list):
+        raise ValueError(f"Unsupported embedding type: {type(value)}")
+
+    return [float(v) if hasattr(v, "__float__") else v for v in value]
 
 
 def _score_step(
@@ -151,14 +183,20 @@ def _score_step(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    ds_group = parser.add_mutually_exclusive_group(required=True)
+    ds_group.add_argument(
         "--dataset",
-        required=True,
+        default=None,
         help="HF dataset id, e.g. vCache/SemBenchmarkClassification",
+    )
+    ds_group.add_argument(
+        "--dataset-csv",
+        default=None,
+        help="Path to a local CSV file. Must contain at least 'prompt' and the --llm-col column.",
     )
     parser.add_argument(
         "--embedding-col",
-        help="Embedding column (optional, no longer used for embeddings as BGE is live).",
+        help="Embedding column (optional). If provided, use precomputed embeddings from this column for vector-DB retrieval/caching instead of BGE live embeddings.",
     )
     parser.add_argument(
         "--llm-col", required=True, help="LLM response column, e.g. response_llama_3_8b"
@@ -221,6 +259,17 @@ def main() -> None:
         default=None,
         help="Path to save per-sample results for curve plotting.",
     )
+    parser.add_argument(
+        "--debug-print",
+        type=int,
+        default=0,
+        help="Print debug info for the first N evaluated samples (0 disables).",
+    )
+    parser.add_argument(
+        "--debug-only-hits",
+        action="store_true",
+        help="When --debug-print is enabled, only print samples that are cache hits.",
+    )
     args = parser.parse_args()
 
     # Mirror: must be set before importing HF libs in a fresh process.
@@ -234,19 +283,28 @@ def main() -> None:
     if args.max_samples is not None:
         split = f"train[:{args.max_samples}]"
 
-    rows = load_dataset(
-        args.dataset,
-        split=split,
-        cache_dir=cache_paths["DATASETS_CACHE"],
-        token=hf_token,
-    )
+    if args.dataset_csv:
+        df = pd.read_csv(args.dataset_csv)
+        if args.max_samples is not None:
+            df = df.head(int(args.max_samples))
+        rows = df.to_dict("records")
+    else:
+        rows = load_dataset(
+            args.dataset,
+            split=split,
+            cache_dir=cache_paths["DATASETS_CACHE"],
+            token=hf_token,
+        )
 
     # Build vCache with benchmark engines (offline eval)
     inference_engine = BenchmarkInferenceEngine()
-    
-    # Use a single shared embedder for both the vector DB and the splitter
-    shared_embedder = EmbeddingModel(device=args.splitter_device)
-    embedding_engine = BGEEmbeddingEngine(embedding_model=shared_embedder)
+
+    splitter_embedder = EmbeddingModel(device=args.splitter_device)
+    use_precomputed_embeddings = bool(args.embedding_col)
+    if use_precomputed_embeddings:
+        embedding_engine = BenchmarkEmbeddingEngine()
+    else:
+        embedding_engine = BGEEmbeddingEngine(embedding_model=splitter_embedder)
 
     if args.similarity_evaluator == "string":
         similarity_evaluator = StringComparisonSimilarityEvaluator()
@@ -264,7 +322,7 @@ def main() -> None:
     splitter = MaxSimSplitter(
         checkpoint_path=args.splitter_checkpoint,
         device=args.splitter_device,
-        embedding_model=shared_embedder,
+        embedding_model=splitter_embedder,
     )
     policy = VerifiedSplitterDecisionPolicy(
         delta=args.delta,
@@ -280,6 +338,7 @@ def main() -> None:
     tp = fp = tn = fn = 0
     n = 0
     per_sample_results = []
+    debug_printed = 0
 
     t0 = time.time()
     pbar = tqdm(rows, desc="Evaluating (Splitter)", unit="samples")
@@ -290,6 +349,13 @@ def main() -> None:
 
         label_response = r[args.llm_col]
 
+        if use_precomputed_embeddings:
+            if args.embedding_col not in r:
+                raise KeyError(
+                    f"--embedding-col='{args.embedding_col}' not found in row keys."
+                )
+            embedding_engine.set_next_embedding(_parse_embedding(r[args.embedding_col]))
+
         # Inject ground truth response for the benchmark engine
         inference_engine.set_next_response(label_response)
 
@@ -298,6 +364,46 @@ def main() -> None:
             system_prompt=system_prompt,
             id_set=id_set,
         )
+
+        if args.debug_print and debug_printed < int(args.debug_print):
+            if (not args.debug_only_hits) or bool(is_hit):
+                nn_prompt = getattr(nn_meta, "prompt", "") if nn_meta is not None else ""
+                nn_id_set = getattr(nn_meta, "id_set", -1) if nn_meta is not None else -1
+                nn_embed_id = getattr(nn_meta, "embedding_id", -1) if nn_meta is not None else -1
+
+                id_match = (id_set != -1 and nn_id_set != -1 and int(id_set) == int(nn_id_set))
+                if id_set != -1:
+                    is_correct = id_match
+                else:
+                    is_correct = answers_have_same_meaning_static(label_response, resp)
+
+                maxsim_s = None
+                if nn_prompt:
+                    try:
+                        maxsim_s = float(policy._maxsim_similarity(prompt, nn_prompt))
+                    except Exception:
+                        maxsim_s = None
+
+                def _short(s: str, n: int = 220) -> str:
+                    s = (s or "").replace("\n", " ").strip()
+                    return s if len(s) <= n else (s[:n] + "...")
+
+                tqdm.write("\n[DEBUG] ===== Splitter Eval Sample =====")
+                tqdm.write(f"[DEBUG] is_hit={bool(is_hit)}")
+                tqdm.write(f"[DEBUG] is_correct={bool(is_correct)}")
+                tqdm.write(f"[DEBUG] query_id_set={id_set}")
+                tqdm.write(f"[DEBUG] nn_embedding_id={nn_embed_id}")
+                tqdm.write(f"[DEBUG] nn_id_set={nn_id_set}")
+                if id_set != -1:
+                    tqdm.write(f"[DEBUG] id_match={bool(id_match)}")
+                if maxsim_s is not None:
+                    tqdm.write(f"[DEBUG] maxsim={maxsim_s:.4f}")
+                tqdm.write(f"[DEBUG] query_prompt={prompt}")
+                tqdm.write(f"[DEBUG] nn_prompt={nn_prompt}")
+                tqdm.write(f"[DEBUG] label_resp={_short(label_response)}")
+                tqdm.write(f"[DEBUG] out_resp={_short(resp)}")
+                sys.stdout.flush()
+                debug_printed += 1
 
         n += 1
         hits += int(is_hit)

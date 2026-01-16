@@ -18,11 +18,12 @@ Usage (example):
     --llm-col response_llama_3_8b \
     --splitter-checkpoint /path/to/ckpt_or_dir \
     --delta 0.02
+    
+    
 """
 
 from __future__ import annotations
 
-import sys
 import argparse
 import json
 import os
@@ -30,12 +31,8 @@ import time
 import warnings
 from typing import Any, Dict, List, Tuple
 
-# Ensure we import `vcache` from this repo (avoid shadow copies like `/home/ali/vcahce` on PYTHONPATH).
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
 import numpy as np
+import pandas as pd
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
@@ -157,10 +154,16 @@ def _score_step(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    ds_group = parser.add_mutually_exclusive_group(required=True)
+    ds_group.add_argument(
         "--dataset",
-        required=True,
+        default=None,
         help="HF dataset id, e.g. vCache/SemBenchmarkClassification",
+    )
+    ds_group.add_argument(
+        "--dataset-csv",
+        default=None,
+        help="Path to a local CSV file. Must contain at least 'prompt' and the --llm-col column.",
     )
     parser.add_argument(
         "--embedding-col",
@@ -206,6 +209,11 @@ def main() -> None:
         help="When candidate-selection=top_k, how many vector-DB neighbors to rerank.",
     )
     parser.add_argument(
+        "--use-cached-candidate-segments",
+        action="store_true",
+        help="Cache candidate MaxSim segment tensors in metadata and only segment the query at request time.",
+    )
+    parser.add_argument(
         "--sleep",
         type=float,
         default=0.002,
@@ -235,12 +243,18 @@ def main() -> None:
     if args.max_samples is not None:
         split = f"train[:{args.max_samples}]"
 
-    rows = load_dataset(
-        args.dataset,
-        split=split,
-        cache_dir=cache_paths["DATASETS_CACHE"],
-        token=hf_token,
-    )
+    if args.dataset_csv:
+        df = pd.read_csv(args.dataset_csv)
+        if args.max_samples is not None:
+            df = df.head(int(args.max_samples))
+        rows = df.to_dict("records")
+    else:
+        rows = load_dataset(
+            args.dataset,
+            split=split,
+            cache_dir=cache_paths["DATASETS_CACHE"],
+            token=hf_token,
+        )
 
     # Build vCache with benchmark engines (offline eval)
     inference_engine = BenchmarkInferenceEngine()
@@ -273,6 +287,7 @@ def main() -> None:
         device=args.splitter_device,
         candidate_selection=args.candidate_selection,
         candidate_k=args.candidate_k,
+        use_cached_candidate_segments=bool(args.use_cached_candidate_segments),
     )
     vcache = VCache(config=config, policy=policy)
 

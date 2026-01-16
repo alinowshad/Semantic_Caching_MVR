@@ -91,11 +91,35 @@ python benchmarks/eval_sembenchmark_verified_splitter.py \
 
 ```
 
+to test a group of candidate-k and delta,run command like this:
+```bash
+poetry run python benchmarks/eval_sembenchmark_verified_splitter.py \
+  --dataset /home/zhengzishan/Semantic_Caching_MVR/vcahce/datasets/filtered_sembenchmark_train.csv \
+  --llm-col response_llama_3_8b \
+  --deltas 0.01 0.015 0.02 0.03 0.05 0.07 0.08 \
+  --candidate-selection multivector_top_k \
+  --candidate-k 5 10 \
+  --splitter-checkpoint ~/checkpoints_words/epoch=29-step=1620.ckpt \
+  --splitter-device cuda:3 \
+  --similarity-evaluator string \
+  --sleep 0.1 \
+  --output-json results/local_verified_splitter.json \
+  --benchmark-output-dir results/benchmark_compat \
+  --benchmark-run-index 1
+```
+results/benchmark_compat directory is for the convenience of drawing graphs with benchmark.py.
+
 ## Baselines and Benchmark Scripts
 
 in the benchmark folder there is file called "/vcahce/benchmarks/benchmark.py" in this file there are all the based line that is the original vcache paper, you can create scripts like eval_sembenchmark_verified* and run those baselines on those datasets.
 
+vcahce/benchmarks/eval_sembenchmark_verified_splitter.py (the original version,without new hnswlib) has been intergrated into vcahce/benchmarks/benchmark*.py to automatically generate various comparison graphs.So you can just run benchmark*.py on three datasets.
+
 ---
+
+## Datasets
+The dataset I used for inference has had the training data removed which is located at /data1/wuyinjun/semantic_cache_dataset/dataset/filtered_sembenchmark_classification.csv,/data1/wuyinjun/semantic_cache_dataset/dataset/filtered_SemBenchmarkLmArena_train.csv,/data1/wuyinjun/semantic_cache_dataset/dataset/filtered_SemBenchmarksqArena_train.csv.All datasets for training is also at 
+/data1/wuyinjun/semantic_cache_dataset/dataset/.
 
 ## Environment Variables (Required)
 

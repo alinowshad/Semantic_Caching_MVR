@@ -2,7 +2,9 @@ import os
 # Set HuggingFace mirror endpoint BEFORE any imports that use it
 # This must be set before importing embedding_model or any transformers-related modules
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
+# classification:  batch_size=24 TRAIN_DATA_SIZE=2560 lr=1e-4 epochs=200
+#    poetry run  python ../RL_SemanticCashing_768/RL4COTrainer.py   --train_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_lmbenchmark2500_pairs_balanced_train.json   --val_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_lmbenchmark2500_pairs_balanced_val.json   --test_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_lmbenchmark2500_pairs_balanced_test.json   --checkpoint_dir ~/checkpoints_words_lm2   --policy_mode separate   --debug_policy   --debug_policy_log_path ~/checkpoints_words_lm2/policy_debug.jsonl   --debug_policy_every_n_epochs 1   --debug_policy_batch_size 8   --debug_policy_topk 10   --debug_policy_n_samples 2   --lr 5e-5 --batch_size 24  --accumulate_grad_batches 2
+# poetry run  python ../RL_SemanticCashing_768/RL4COTrainer.py   --train_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_lmbenchmark2500_pairs_balanced_train.json   --val_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_lmbenchmark2500_pairs_balanced_val.json   --test_pairs_json /data1/wuyinjun/semantic_cache_dataset/dataset/semantic_prompt_cache_lmbenchmark2500_pairs_balanced_test.json   --checkpoint_dir ~/checkpoints_words_bef   --policy_mode separate   --debug_policy   --debug_policy_log_path ~/checkpoints_words_bef/policy_debug.jsonl   --debug_policy_every_n_epochs 1   --debug_policy_batch_size 8   --debug_policy_topk 10   --debug_policy_n_samples 2   --lr 5e-5 --batch_size 24  --accumulate_grad_batches 2 --split_words_before --gpu_id 1
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -25,6 +27,22 @@ from MaxSimGenerator import MaxSimGenerator
 from AdaptedPointerNetworkPolicy import AdaptedPointerNetworkPolicy
 from embedding_model import EmbeddingModel
 from calibrator import SigmoidCalibrator
+
+def _print_cuda_mem(tag):
+    try:
+        if torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            name = torch.cuda.get_device_name(dev)
+            alloc = torch.cuda.memory_allocated(dev) / (1024**2)
+            reserved = torch.cuda.memory_reserved(dev) / (1024**2)
+            max_alloc = torch.cuda.max_memory_allocated(dev) / (1024**2)
+            print(
+                f"[MEM][{tag}] device={dev}({name}) alloc={alloc:.1f}MB reserved={reserved:.1f}MB max_alloc={max_alloc:.1f}MB"
+            )
+        else:
+            print(f"[MEM][{tag}] CUDA not available")
+    except Exception as e:
+        print(f"[MEM][{tag}] failed: {e}")
 
 class ResumeFriendlyREINFORCE(REINFORCE):
 
@@ -471,6 +489,27 @@ if __name__ == '__main__':
         choices=["joint", "separate"],
         help="Policy architecture mode: 'joint' uses A<->B cross-attention; 'separate' runs phi(x) and phi(y) independently (shared weights) then interleaves actions.",
     )
+    parser.add_argument(
+        "--split_on_space",
+        action="store_true",
+        help="If set, treat whitespace/word-boundary tokens as additional split delimiters (in addition to punctuation/connector words).",
+    )
+    parser.add_argument(
+        "--split_words_before",
+        action="store_true",
+        help="If set, treat connector-word split markers as boundaries *before* the word (so the connector joins the following segment).",
+    )
+    parser.add_argument(
+        "--gpu_id",
+        type=int,
+        default=0,
+    )
+    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max_epochs", type=int, default=200)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=2)
+    parser.add_argument("--check_val_every_n_epoch", type=int, default=5)
+    parser.add_argument("--train_data_size", type=int, default=2560)
     args = parser.parse_args()
     print(f"[ARGS] train_file={args.train_file}")
     print(f"[ARGS] train_pairs_json={args.train_pairs_json}")
@@ -485,6 +524,15 @@ if __name__ == '__main__':
     print(f"[ARGS] debug_policy_log_path={args.debug_policy_log_path}")
     print(f"[ARGS] debug_policy_every_n_epochs={args.debug_policy_every_n_epochs}")
     print(f"[ARGS] policy_mode={args.policy_mode}")
+    print(f"[ARGS] split_on_space={args.split_on_space}")
+    print(f"[ARGS] split_words_before={args.split_words_before}")
+    print(f"[ARGS] gpu_id={args.gpu_id}")
+    print(f"[ARGS] batch_size={args.batch_size}")
+    print(f"[ARGS] lr={args.lr}")
+    print(f"[ARGS] max_epochs={args.max_epochs}")
+    print(f"[ARGS] accumulate_grad_batches={args.accumulate_grad_batches}")
+    print(f"[ARGS] check_val_every_n_epoch={args.check_val_every_n_epoch}")
+    print(f"[ARGS] train_data_size={args.train_data_size}")
     
     # Verify HF_ENDPOINT is set correctly
     hf_endpoint = os.environ.get('HF_ENDPOINT', 'Not set')
@@ -495,20 +543,6 @@ if __name__ == '__main__':
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
         pass
-
-    def _print_cuda_mem(tag):
-        try:
-            if torch.cuda.is_available():
-                dev = torch.cuda.current_device()
-                name = torch.cuda.get_device_name(dev)
-                alloc = torch.cuda.memory_allocated(dev) / (1024**2)
-                reserved = torch.cuda.memory_reserved(dev) / (1024**2)
-                max_alloc = torch.cuda.max_memory_allocated(dev) / (1024**2)
-                print(f"[MEM][{tag}] device={dev}({name}) alloc={alloc:.1f}MB reserved={reserved:.1f}MB max_alloc={max_alloc:.1f}MB")
-            else:
-                print(f"[MEM][{tag}] CUDA not available")
-        except Exception as e:
-            print(f"[MEM][{tag}] failed: {e}")
 
     train_pairs = load_pairs_from_json(args.train_pairs_json) if args.train_pairs_json else None
     val_pairs = load_pairs_from_json(args.val_pairs_json) if args.val_pairs_json else None
@@ -533,16 +567,25 @@ if __name__ == '__main__':
     MAX_SEGMENTS = 8  # 最大分割片段数
     TRAIN_DATA_SIZE = len(train_pairs) if train_pairs is not None else len(train_prompts)
     VAL_DATA_SIZE = len(val_pairs) if val_pairs is not None else len(val_prompts)
-    BATCH_SIZE = 24 
-    MAX_EPOCHS = 200  # 最大训练轮数
+    BATCH_SIZE = int(args.batch_size)
+    MAX_EPOCHS = int(args.max_epochs)  # 最大训练轮数
 
 
     print("Step 1: Instantiating components...")
 
     # Determine device for embedding model / env.
     # IMPORTANT: Keep this consistent with Lightning's `devices` argument below.
-    GPU_ID = 2
-    device = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
+    GPU_ID = int(args.gpu_id)
+    if torch.cuda.is_available():
+        n_cuda = int(torch.cuda.device_count())
+        if GPU_ID < 0 or GPU_ID >= n_cuda:
+            raise ValueError(
+                f"Invalid --gpu_id={GPU_ID}. Visible CUDA device_count={n_cuda}. "
+                "If you set CUDA_VISIBLE_DEVICES, gpu_id is relative to the visible devices (usually start at 0)."
+            )
+        device = torch.device(f"cuda:{GPU_ID}")
+    else:
+        device = torch.device("cpu")
     print(f"[DEVICE] Using device: {device} for embedding model / env")
 
     embedding_model = EmbeddingModel(device=device)
@@ -581,6 +624,8 @@ if __name__ == '__main__':
         hidden_dim=768,
         max_segments=MAX_SEGMENTS,
         policy_mode=str(args.policy_mode),
+        split_on_space=bool(args.split_on_space),
+        split_words_before=bool(args.split_words_before),
     )
     print("Components instantiated.")
 
@@ -591,14 +636,13 @@ if __name__ == '__main__':
         'env': train_env,
         'policy': policy,
         'baseline': 'rollout',
-        'train_data_size': 2560,  
+        'train_data_size': int(args.train_data_size),
         'val_data_size': VAL_DATA_SIZE,
         'batch_size': BATCH_SIZE,
         'dataloader_num_workers': 0,
-        'optimizer_kwargs': {'lr': 1e-4},
+        'optimizer_kwargs': {'lr': float(args.lr)},
       
     }
-    
   
     model = ResumeFriendlyREINFORCE(**model_kwargs)
     
@@ -638,6 +682,7 @@ if __name__ == '__main__':
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=[GPU_ID] if torch.cuda.is_available() else 1,
         logger=logger, 
+
         callbacks=[
             early_stopping_callback,
             checkpoint_callback,
@@ -657,8 +702,8 @@ if __name__ == '__main__':
             ),
         ], 
         num_sanity_val_steps=1,  
-        check_val_every_n_epoch=5,
-        accumulate_grad_batches=2,
+        check_val_every_n_epoch=int(args.check_val_every_n_epoch),
+        accumulate_grad_batches=int(args.accumulate_grad_batches),
         reload_dataloaders_every_n_epochs=1,
     )
     print("RL4COTrainer configured with Early Stopping and Checkpointing.")

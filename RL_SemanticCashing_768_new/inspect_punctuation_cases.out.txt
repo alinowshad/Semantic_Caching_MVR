@@ -1,0 +1,111 @@
+[INFO] Loading model BAAI/bge-base-en-v1.5 from https://hf-mirror.com
+[DEVICE] EmbeddingModel moved to cuda:2
+[GEN] bs=1 device=cuda:2 lm_device=cuda:2 max_len=512
+[CKPT] Loaded policy weights from /data2/ali/checkpoints/last.ckpt
+[CKPT] missing_keys=0 unexpected_keys=0
+
+=== Batch summary ===
+policy info keys: ['avg_valid_a', 'avg_valid_b', 'frac_any_valid_a', 'frac_any_valid_b', 'frac_zero_log_likelihood', 'mean_log_likelihood', 'min_valid_a', 'min_valid_b'] 
+avg_valid_a: 2.9609375
+avg_valid_b: 4.6328125
+frac_any_valid_a: 0.3828125
+frac_any_valid_b: 0.421875
+frac_zero_log_likelihood: 0.0
+
+=== Per-sample inspection (step 0 candidates) ===
+
+-- sample 0 reward=0.565799
+A: len=131 n_candidates(step0)=12 chosen=28 token=.
+  A candidates (first 12): [(11, ','), (28, '.'), (40, ','), (48, '.'), (69, '.'), (85, '.'), (92, ','), (102, '.'), (115, ','), (118, ','), (129, '.'), (130, '[SEP]')]
+B: len=221 n_candidates(step0)=20 chosen=16 token=:
+  B candidates (first 12): [(16, ':'), (20, ':'), (24, '.'), (32, '.'), (51, '.'), (56, ','), (58, ','), (62, ','), (76, '.'), (99, '.'), (128, '.'), (131, ':')]
+
+-- sample 1 reward=0.574396
+A: len=86 n_candidates(step0)=10 chosen=25 token=,
+  A candidates (first 12): [(25, ','), (30, ','), (34, '.'), (50, '.'), (59, ','), (62, '.'), (67, ','), (80, ','), (84, '.'), (85, '[SEP]')]
+B: len=140 n_candidates(step0)=8 chosen=39 token=.
+  B candidates (first 12): [(39, '.'), (57, '.'), (70, '.'), (89, ','), (99, '.'), (122, '.'), (138, '.'), (139, '[SEP]')]
+
+-- sample 2 reward=0.599389
+A: len=30 n_candidates(step0)=1 chosen=29 token=[SEP]
+  A candidates (first 12): [(29, '[SEP]')]
+B: len=512 n_candidates(step0)=81 chosen=118 token=.
+  B candidates (first 12): [(13, ','), (33, '.'), (41, ':'), (47, '.'), (57, ':'), (59, ';'), (61, '.'), (75, ':'), (77, ';'), (84, '.'), (95, ':'), (97, '!')]
+
+-- sample 3 reward=0.607587
+A: len=190 n_candidates(step0)=30 chosen=147 token=,
+  A candidates (first 12): [(28, '.'), (39, ','), (45, '.'), (47, ':'), (72, ','), (77, ','), (79, ','), (82, ','), (84, ','), (94, '.'), (99, ','), (105, ',')]
+B: len=244 n_candidates(step0)=19 chosen=111 token=.
+  B candidates (first 12): [(10, ','), (13, ':'), (18, ':'), (22, ':'), (36, ','), (44, '.'), (62, '.'), (83, ','), (111, '.'), (130, '.'), (132, ','), (141, '.')]
+
+-- sample 4 reward=0.639246
+A: len=247 n_candidates(step0)=28 chosen=195 token=.
+  A candidates (first 12): [(14, ','), (24, ':'), (35, ','), (40, '.'), (55, '.'), (73, '.'), (89, '.'), (106, '.'), (117, '.'), (131, '.'), (145, '.'), (148, ':')]
+B: len=144 n_candidates(step0)=9 chosen=82 token=.
+  B candidates (first 12): [(39, '.'), (51, '.'), (74, '.'), (82, '.'), (98, '.'), (119, '.'), (139, '.'), (142, '.'), (143, '[SEP]')]
+
+-- sample 5 reward=0.561454
+A: len=512 n_candidates(step0)=38 chosen=333 token=,
+  A candidates (first 12): [(9, ','), (22, ','), (50, '.'), (55, ','), (69, ','), (76, ','), (81, ','), (93, '.'), (126, '.'), (145, '.'), (168, ','), (171, ',')]
+B: len=399 n_candidates(step0)=38 chosen=334 token=;
+  B candidates (first 12): [(18, ','), (56, '.'), (63, '.'), (76, '.'), (92, '.'), (106, '.'), (120, '.'), (124, ':'), (133, '.'), (168, '.'), (184, '.'), (187, ':')]
+
+-- sample 6 reward=0.576546
+A: len=126 n_candidates(step0)=12 chosen=26 token=.
+  A candidates (first 12): [(24, ':'), (26, '.'), (35, '.'), (37, '.'), (44, ','), (52, '.'), (67, '?'), (80, ','), (91, ','), (98, '.'), (124, '.'), (125, '[SEP]')]
+B: len=201 n_candidates(step0)=19 chosen=137 token=,
+  B candidates (first 12): [(44, ','), (46, ','), (48, ','), (51, ','), (66, ','), (81, '.'), (117, '.'), (127, '.'), (132, '.'), (137, ','), (151, '.'), (153, ':')]
+
+-- sample 7 reward=0.602141
+A: len=87 n_candidates(step0)=3 chosen=85 token=.
+  A candidates (first 12): [(62, '.'), (85, '.'), (86, '[SEP]')]
+B: len=91 n_candidates(step0)=6 chosen=90 token=[SEP]
+  B candidates (first 12): [(12, ':'), (30, '.'), (54, '.'), (70, '.'), (89, '.'), (90, '[SEP]')]
+
+-- sample 8 reward=0.591973
+A: len=85 n_candidates(step0)=9 chosen=84 token=[SEP]
+  A candidates (first 12): [(20, ','), (41, '.'), (51, '.'), (63, '.'), (67, ','), (71, ','), (75, ','), (79, ','), (84, '[SEP]')]
+B: len=182 n_candidates(step0)=14 chosen=87 token=,
+  B candidates (first 12): [(44, '?'), (55, '.'), (66, ','), (77, '.'), (87, ','), (98, ','), (102, ','), (121, ','), (132, '.'), (138, ','), (160, '.'), (163, ',')]
+
+-- sample 9 reward=0.575044
+A: len=202 n_candidates(step0)=23 chosen=188 token=:
+  A candidates (first 12): [(6, '.'), (19, ','), (25, ','), (28, ','), (30, ','), (33, ','), (65, '.'), (83, '.'), (104, '.'), (106, ','), (117, ','), (126, '.')]
+B: len=58 n_candidates(step0)=8 chosen=49 token=,
+  B candidates (first 12): [(8, ','), (10, '.'), (15, ','), (47, ','), (49, ','), (52, '.'), (56, '.'), (57, '[SEP]')]
+
+-- sample 10 reward=0.588289
+A: len=280 n_candidates(step0)=28 chosen=206 token=,
+  A candidates (first 12): [(34, ','), (44, '.'), (64, ','), (80, '.'), (104, '.'), (121, '.'), (129, ','), (140, '.'), (147, ','), (153, '.'), (161, ','), (168, '.')]
+B: len=108 n_candidates(step0)=6 chosen=65 token=.
+  B candidates (first 12): [(25, '.'), (45, '.'), (65, '.'), (87, '.'), (106, '.'), (107, '[SEP]')]
+
+-- sample 11 reward=0.538676
+A: len=77 n_candidates(step0)=5 chosen=41 token=.
+  A candidates (first 12): [(27, '!'), (28, '!'), (41, '.'), (46, '.'), (76, '[SEP]')]
+B: len=487 n_candidates(step0)=52 chosen=278 token=[UNK]
+  B candidates (first 12): [(9, ','), (15, ','), (58, '?'), (71, '.'), (72, '?'), (86, '.'), (87, '?'), (90, ','), (100, ':'), (113, '.'), (114, '?'), (132, '.')]
+
+-- sample 12 reward=0.512774
+A: len=75 n_candidates(step0)=5 chosen=47 token=!
+  A candidates (first 12): [(16, '?'), (47, '!'), (67, ','), (73, '.'), (74, '[SEP]')]
+B: len=14 n_candidates(step0)=2 chosen=10 token=:
+  B candidates (first 12): [(10, ':'), (13, '[SEP]')]
+
+-- sample 13 reward=0.547844
+A: len=87 n_candidates(step0)=9 chosen=23 token=,
+  A candidates (first 12): [(3, '.'), (23, ','), (31, ','), (48, '.'), (56, '.'), (65, '.'), (73, '.'), (85, '.'), (86, '[SEP]')]
+B: len=12 n_candidates(step0)=1 chosen=11 token=[SEP]
+  B candidates (first 12): [(11, '[SEP]')]
+
+-- sample 14 reward=0.556150
+A: len=169 n_candidates(step0)=15 chosen=93 token=.
+  A candidates (first 12): [(21, ':'), (26, '?'), (38, '.'), (56, '.'), (73, '.'), (83, ','), (93, '.'), (105, '.'), (115, '.'), (127, '.'), (134, ','), (138, ',')]
+B: len=28 n_candidates(step0)=5 chosen=18 token=,
+  B candidates (first 12): [(18, ','), (20, ','), (22, ','), (24, ','), (27, '[SEP]')]
+
+-- sample 15 reward=0.528185
+A: len=24 n_candidates(step0)=3 chosen=6 token=,
+  A candidates (first 12): [(6, ','), (9, ','), (23, '[SEP]')]
+B: len=45 n_candidates(step0)=4 chosen=26 token=.
+  B candidates (first 12): [(20, '.'), (26, '.'), (43, '.'), (44, '[SEP]')]

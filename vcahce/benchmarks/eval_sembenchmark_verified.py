@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
@@ -133,10 +134,14 @@ def _score_step(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    ds_group = parser.add_mutually_exclusive_group(required=True)
+    ds_group.add_argument(
         "--dataset",
-        required=True,
         help="HF dataset id, e.g. vCache/SemBenchmarkClassification",
+    )
+    ds_group.add_argument(
+        "--dataset-csv",
+        help="Path to a CSV file containing the dataset (must include prompt and the LLM response column).",
     )
     parser.add_argument(
         "--embedding-col",
@@ -176,6 +181,16 @@ def main() -> None:
         default=None,
         help="Path to save per-sample results for curve plotting.",
     )
+    parser.add_argument(
+        "--debug-print",
+        action="store_true",
+        help="Print selected nearest prompt/id_set and similarity information per step.",
+    )
+    parser.add_argument(
+        "--debug-only-hits",
+        action="store_true",
+        help="Only print debug lines for cache hits (requires --debug-print).",
+    )
     args = parser.parse_args()
 
     # Mirror: must be set before importing HF libs in a fresh process.
@@ -186,16 +201,22 @@ def main() -> None:
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
 
     # Load dataset
-    split = "train"
-    if args.max_samples is not None:
-        split = f"train[:{args.max_samples}]"
+    if args.dataset_csv:
+        df = pd.read_csv(args.dataset_csv)
+        if args.max_samples is not None:
+            df = df.head(int(args.max_samples))
+        rows = df.to_dict(orient="records")
+    else:
+        split = "train"
+        if args.max_samples is not None:
+            split = f"train[:{args.max_samples}]"
 
-    rows = load_dataset(
-        args.dataset,
-        split=split,
-        cache_dir=cache_paths["DATASETS_CACHE"],
-        token=hf_token,
-    )
+        rows = load_dataset(
+            args.dataset,
+            split=split,
+            cache_dir=cache_paths["DATASETS_CACHE"],
+            token=hf_token,
+        )
 
     # Build vCache with benchmark engines (offline eval)
     inference_engine = BenchmarkInferenceEngine()
@@ -247,6 +268,33 @@ def main() -> None:
             id_set=id_set,
         )
 
+        if args.debug_print and (not args.debug_only_hits or bool(is_hit)):
+            similarity_score = None
+            try:
+                knn = vcache.vcache_policy.cache.get_knn(prompt=prompt, k=1)
+                if knn:
+                    similarity_score = float(knn[0][0])
+            except Exception:
+                similarity_score = None
+
+            nn_prompt = getattr(nn_meta, "prompt", "") if nn_meta is not None else ""
+            nn_id_set = getattr(nn_meta, "id_set", -1) if nn_meta is not None else -1
+
+            prompt_preview = (prompt or "")[:300]
+            system_prompt_preview = (system_prompt or "")[:300]
+            label_preview = (label_response or "")[:300]
+            resp_preview = (resp or "")[:300]
+
+            print(
+                f"[debug] i={n+1} hit={bool(is_hit)} sim={similarity_score} label_id_set={id_set} nn_id_set={nn_id_set}"
+            )
+            print(f"[debug] prompt={prompt_preview}")
+            if system_prompt_preview:
+                print(f"[debug] system_prompt={system_prompt_preview}")
+            print(f"[debug] label_response={label_preview}")
+            print(f"[debug] returned_response={resp_preview}")
+            print(f"[debug] nn_prompt={nn_prompt[:300]}")
+
         n += 1
         hits += int(is_hit)
         d_tp, d_fp, d_tn, d_fn = _score_step(
@@ -286,7 +334,8 @@ def main() -> None:
 
     elapsed = time.time() - t0
 
-    print(f"dataset={args.dataset}")
+    dataset_label = args.dataset if args.dataset else args.dataset_csv
+    print(f"dataset={dataset_label}")
     print(f"columns: embedding={args.embedding_col} llm={args.llm_col}")
     print(f"delta={args.delta} n={n} time={elapsed:.2f}s")
     print(f"hit_rate={hits}/{n} ({(hits/max(1,n)):.1%})")
@@ -324,3 +373,4 @@ if __name__ == "__main__":
     main()
 
 
+#  poetry run python benchmarks/eval_sembenchmark_verified.py --dataset-csv /data1/wuyinjun/semantic_cache_dataset/dataset/filtered_SemBenchmarkLmArena_train.csv --llm-col response_gpt-4o-mini --delta 0.02 --sleep 0.1 --output-json results/verified_origin_cuda_cachedcandsegments.json --debug-print

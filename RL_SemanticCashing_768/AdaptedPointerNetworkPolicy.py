@@ -62,12 +62,16 @@ class AdaptedPointerNetworkPolicy(nn.Module):
                  num_encoder_layers=2,
                  *,
                  policy_mode: str = "joint",
+                 split_on_space: bool = False,
+                 split_words_before: bool = False,
                 ):
         super().__init__()
         self.env = env
         self.hidden_dim = hidden_dim
         self.max_segments = max_segments
         self.policy_mode = str(policy_mode).lower().strip()
+        self.split_on_space = bool(split_on_space)
+        self.split_words_before = bool(split_words_before)
         if self.policy_mode not in {"joint", "separate"}:
             raise ValueError(f"Unsupported policy_mode={policy_mode!r}. Use 'joint' or 'separate'.")
       
@@ -176,6 +180,211 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             "similarly",
         ]
 
+        self._special_token_ids = None
+        self._special_token_ids_tensor = {}
+        self._word_boundary_cache: dict[int, bool] = {}
+        self._word_boundary_mode: str | None = None
+
+    @property
+    def device(self) -> torch.device:
+        d = getattr(self, "_device", None)
+        if isinstance(d, torch.device):
+            return d
+        try:
+            return next(self.parameters()).device
+        except Exception:
+            return torch.device("cpu")
+
+    def _init_special_token_ids(self) -> set[int]:
+        if isinstance(self._special_token_ids, set):
+            return self._special_token_ids
+        special_ids: set[int] = set()
+        tok = getattr(self, "tokenizer", None)
+        for attr in [
+            "pad_token_id",
+            "cls_token_id",
+            "sep_token_id",
+            "eos_token_id",
+            "bos_token_id",
+            "unk_token_id",
+        ]:
+            v = getattr(tok, attr, None)
+            if v is not None:
+                try:
+                    special_ids.add(int(v))
+                except Exception:
+                    pass
+        self._special_token_ids = special_ids
+        return special_ids
+
+    def _get_special_token_ids_tensor(self, device: torch.device) -> torch.Tensor | None:
+        t = self._special_token_ids_tensor.get(device)
+        if isinstance(t, torch.Tensor):
+            return t
+        special_ids = self._init_special_token_ids()
+        if not special_ids:
+            self._special_token_ids_tensor[device] = None
+            return None
+        tt = torch.tensor(sorted(list(special_ids)), device=device, dtype=torch.long)
+        self._special_token_ids_tensor[device] = tt
+        return tt
+
+    def _ensure_word_boundary_mode(self, token_strs: list[str]) -> str:
+        if self._word_boundary_mode is not None:
+            return self._word_boundary_mode
+        mode = "wordpiece"
+        for t in token_strs:
+            if isinstance(t, str) and t.startswith("Ġ"):
+                mode = "gpt2"
+                break
+            if isinstance(t, str) and t.startswith("▁"):
+                mode = "sentencepiece"
+                break
+        self._word_boundary_mode = mode
+        return mode
+
+    def _is_word_boundary_token_str(self, t: str) -> bool:
+        if not isinstance(t, str) or not t:
+            return False
+        mode = self._word_boundary_mode or "wordpiece"
+        if mode == "gpt2":
+            return t.startswith("Ġ")
+        if mode == "sentencepiece":
+            return t.startswith("▁")
+        return not t.startswith("##")
+
+    def _get_word_boundary_ids_tensor(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        tok = getattr(self, "tokenizer", None)
+        if tok is None:
+            return None
+        special_ids = self._init_special_token_ids()
+        uniq = torch.unique(input_ids).detach().to("cpu")
+        uniq_list = [int(x) for x in uniq.tolist()]
+
+        if self._word_boundary_mode is None:
+            probe = uniq_list[: min(len(uniq_list), 4096)]
+            probe_tokens = []
+            for tid in probe:
+                if tid in special_ids:
+                    continue
+                try:
+                    probe_tokens.append(tok.convert_ids_to_tokens(int(tid)))
+                except Exception:
+                    continue
+            self._ensure_word_boundary_mode(probe_tokens)
+
+        boundary_ids: list[int] = []
+        for tid in uniq_list:
+            if tid in special_ids:
+                continue
+            cached = self._word_boundary_cache.get(tid)
+            if cached is None:
+                try:
+                    t = tok.convert_ids_to_tokens(int(tid))
+                except Exception:
+                    self._word_boundary_cache[tid] = False
+                    continue
+                cached = self._is_word_boundary_token_str(t)
+                self._word_boundary_cache[tid] = bool(cached)
+            if cached:
+                boundary_ids.append(tid)
+
+        if not boundary_ids:
+            return None
+        return torch.tensor(boundary_ids, device=input_ids.device, dtype=torch.long)
+
+    def _init_punctuation_ids(self, device):
+        """
+        初始化有效的分割token ID集合。
+        包含: 基础标点 + 带空格的标点变体 + 可选连接词 split_words。
+
+        IMPORTANT: Do NOT include special tokens like [SEP]/[EOS]/[CLS]/[PAD] as "punctuation".
+        If [SEP] is treated as a valid split point, the policy can end immediately by choosing it
+        on step 0, then the "future boundary" constraint makes all subsequent steps invalid,
+        leading to repeated fallbacks and degenerate behavior.
+        """
+      
+        if hasattr(self, "_valid_split_ids") and self._valid_split_ids is not None:
+            if self._valid_split_ids.device == device:
+                return
+        
+      
+        punct_chars = {",", ".", "!", "?", ":", ";", "，", "。", "！", "？", "：", "；"}
+        punct_ids = set()
+        connector_ids = set()
+            
+  
+        for char in punct_chars:
+            # Case A: 纯标点
+            ids = self.tokenizer.encode(char, add_special_tokens=False)
+            if ids: punct_ids.update(ids)
+            
+            # Case B: 带空格前缀
+            ids_space = self.tokenizer.encode(" " + char, add_special_tokens=False)
+            if ids_space: punct_ids.update(ids_space)
+
+        # Add connector words as split markers (single-token only).
+        for w in getattr(self, "split_words", []) or []:
+            # Include both raw and space-prefixed forms for different tokenizer families.
+            for ww in {w, w.capitalize()}:
+                for prefix in ("", " "):
+                    ids = self.tokenizer.encode(prefix + ww, add_special_tokens=False)
+                    # Only accept markers that map to a single token id to avoid mid-word splits.
+                    if isinstance(ids, list) and len(ids) == 1:
+                        connector_ids.add(ids[0])
+
+     
+        sorted_punct_ids = sorted(list(punct_ids))
+        sorted_connector_ids = sorted(list(connector_ids))
+
+        self._punct_split_ids = (
+            torch.tensor(sorted_punct_ids, device=device, dtype=torch.long)
+            if sorted_punct_ids
+            else torch.empty((0,), device=device, dtype=torch.long)
+        )
+        self._connector_split_ids = (
+            torch.tensor(sorted_connector_ids, device=device, dtype=torch.long)
+            if sorted_connector_ids
+            else torch.empty((0,), device=device, dtype=torch.long)
+        )
+
+        sorted_ids = sorted(list(punct_ids | connector_ids))
+        self._valid_split_ids = (
+            torch.tensor(sorted_ids, device=device, dtype=torch.long)
+            if sorted_ids
+            else torch.empty((0,), device=device, dtype=torch.long)
+        )
+
+    def _compute_split_candidate_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
+        is_punct_global = (
+            torch.isin(input_ids, self._punct_split_ids)
+            if hasattr(self, "_punct_split_ids") and isinstance(self._punct_split_ids, torch.Tensor)
+            else torch.zeros_like(input_ids, dtype=torch.bool)
+        )
+
+        if hasattr(self, "_connector_split_ids") and isinstance(
+            self._connector_split_ids, torch.Tensor
+        ):
+            if int(self._connector_split_ids.numel()) > 0:
+                is_conn = torch.isin(input_ids, self._connector_split_ids)
+                if self.split_words_before:
+                    is_conn_before = torch.zeros_like(is_conn)
+                    is_conn_before[:, :-1] = is_conn[:, 1:]
+                    is_conn_before[:, 0] = False
+                    sp_t = self._get_special_token_ids_tensor(input_ids.device)
+                    if isinstance(sp_t, torch.Tensor) and int(sp_t.numel()) > 0:
+                        is_conn_before = is_conn_before & (~torch.isin(input_ids, sp_t))
+                    is_punct_global = is_punct_global | is_conn_before
+                else:
+                    is_punct_global = is_punct_global | is_conn
+
+        if self.split_on_space:
+            word_ids = self._get_word_boundary_ids_tensor(input_ids)
+            if word_ids is not None:
+                is_punct_global = is_punct_global | torch.isin(input_ids, word_ids)
+
+        return is_punct_global
+
     def _decode_single(
         self,
         *,
@@ -186,7 +395,7 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         debug: bool = False,
         debug_topk: int = 8,
         debug_n_samples: int = 1,
-        side: str = "A",
+        side: str = "S",
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Decode segmentation pointers for a single sequence (factorized policy mode).
@@ -198,8 +407,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         """
         batch_size, seq_len, _ = encoder_outputs.shape
 
-        # Precompute punctuation mask [B, L]
-        is_punct_global = torch.isin(input_ids, self._valid_split_ids)
+        # Precompute split-marker mask [B, L]
+        is_punct_global = self._compute_split_candidate_mask(input_ids)
 
         # Decoder init
         decoder_input = self.decoder_start_input.unsqueeze(0).repeat(batch_size, 1)
@@ -220,7 +429,7 @@ class AdaptedPointerNetworkPolicy(nn.Module):
 
         for step in range(self.max_segments):
             h, c = self.decoder_cell(decoder_input, (h, c))
-            query_vec = self.attention_linear_decoder(h)  # [B, H]
+            query_vec = self.attention_linear_decoder(h)
 
             rng = torch.arange(seq_len, device=self.device).expand(batch_size, -1)
             is_future = rng > current_b.unsqueeze(1)
@@ -254,6 +463,7 @@ class AdaptedPointerNetworkPolicy(nn.Module):
                 pointer[rows] = (eff_len[rows] - 1).clamp(min=1)
 
             if debug:
+                # Capture step-level debug info for the first N samples
                 n_dbg = min(int(debug_n_samples), batch_size)
                 for bi in range(n_dbg):
                     pb = int(pointer[bi].item())
@@ -321,58 +531,6 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             info["debug_records"] = debug_records
 
         return pointers, logp_total, info
-    def _init_punctuation_ids(self, device):
-        """
-        初始化有效的分割token ID集合。
-        包含: 基础标点 + 带空格的标点变体 + 可选连接词 split_words。
-
-        IMPORTANT: Do NOT include special tokens like [SEP]/[EOS]/[CLS]/[PAD] as "punctuation".
-        If [SEP] is treated as a valid split point, the policy can end immediately by choosing it
-        on step 0, then the "future boundary" constraint makes all subsequent steps invalid,
-        leading to repeated fallbacks and degenerate behavior.
-        """
-      
-        if hasattr(self, "_valid_split_ids") and self._valid_split_ids is not None:
-            if self._valid_split_ids.device == device:
-                return
-        
-      
-        punct_chars = {",", ".", "!", "?", ":", ";", "，", "。", "！", "？", "：", "；"}
-        valid_ids = set()
-            
-  
-        for char in punct_chars:
-            # Case A: 纯标点
-            ids = self.tokenizer.encode(char, add_special_tokens=False)
-            if ids: valid_ids.update(ids)
-            
-            # Case B: 带空格前缀
-            ids_space = self.tokenizer.encode(" " + char, add_special_tokens=False)
-            if ids_space: valid_ids.update(ids_space)
-
-        # Add connector words as split markers (single-token only).
-        for w in getattr(self, "split_words", []) or []:
-            # Include both raw and space-prefixed forms for different tokenizer families.
-            for ww in {w, w.capitalize()}:
-                for prefix in ("", " "):
-                    ids = self.tokenizer.encode(prefix + ww, add_special_tokens=False)
-                    # Only accept markers that map to a single token id to avoid mid-word splits.
-                    if isinstance(ids, list) and len(ids) == 1:
-                        valid_ids.add(ids[0])
-
-     
-        sorted_ids = sorted(list(valid_ids))
-        self._valid_split_ids = torch.tensor(sorted_ids, device=device, dtype=torch.long)
-    @property
-    def device(self):
-        """获取模型所在的设备"""
-        if hasattr(self, '_device'):
-            return self._device
-      
-        try:
-            return next(self.parameters()).device
-        except StopIteration:
-            return torch.device('cpu')
 
     def forward(self, td, env=None, phase: str = "train", select_best: bool = False, **kwargs):
         """与 RL4CO 的 REINFORCE 调用约定兼容的入口。
@@ -581,7 +739,7 @@ class AdaptedPointerNetworkPolicy(nn.Module):
 
         # ============================
         # Separate (factorized) mode:
-        # run phi(x) and phi(y) independently (shared weights), then interleave actions.
+        # run φ(x) and φ(y) independently (shared weights), then interleave actions.
         # ============================
         if self.policy_mode == "separate":
             # Use the single-text API twice (φ(x), φ(y)), then combine.
@@ -669,8 +827,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
 
         # 预计算全局标点 Mask [batch, seq_len]
     
-        is_punct_global_a = torch.isin(td['input_ids_a'], self._valid_split_ids)
-        is_punct_global_b = torch.isin(td['input_ids_b'], self._valid_split_ids)
+        is_punct_global_a = self._compute_split_candidate_mask(td['input_ids_a'])
+        is_punct_global_b = self._compute_split_candidate_mask(td['input_ids_b'])
 
         # Ensure we always keep at least [CLS] plus one token in range computations
         eff_len_a = eff_len_a.clamp(min=2)

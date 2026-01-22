@@ -9,6 +9,9 @@ __old/*
 *.json
 benchmarks/data/large_scale/*.json
 benchmarks/results/*
+results/benchmark_compat/*
+results/benchmark_compat_lm/*
+results/benchmark_compat_sq/*
 temp/*
 *.log
 benchmarks/*.parquet
@@ -16,3 +19,12 @@ bin/*
 .venv/
 .env
 *.DS_Store
+
+
+*.npy
+*.parquet
+*.tsv
+*.so
+*.o
+__pycache__/
+*.pyc

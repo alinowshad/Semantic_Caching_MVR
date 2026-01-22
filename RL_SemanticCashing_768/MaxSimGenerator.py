@@ -3,11 +3,18 @@ import numpy as np
 import sys
 import os
 import json
+import re
 from pathlib import Path
 from tensordict import TensorDict
 from rl4co.envs.common.utils import Generator
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from embedding_model import EmbeddingModel
+
+def _clean_prompt_text(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    s = re.sub(r"^\s*>\s*", "", s)
+    return s.strip()
 
 class MaxSimGenerator(Generator):
     def __init__(
@@ -97,15 +104,15 @@ class MaxSimGenerator(Generator):
                 idxs.append(int(self._pair_order[self._pair_cursor]))
                 self._pair_cursor += 1
 
-            texts_a = [self.pairs[i]["sentence_1"] for i in idxs]
-            texts_b = [self.pairs[i]["sentence_2"] for i in idxs]
+            texts_a = [_clean_prompt_text(self.pairs[i]["sentence_1"]) for i in idxs]
+            texts_b = [_clean_prompt_text(self.pairs[i]["sentence_2"]) for i in idxs]
             correct = torch.tensor([int(self.pairs[i]["correct"]) for i in idxs], dtype=torch.float32)
         else:
             # 随机采样文本对 (with replacement)
             indices_a = np.random.randint(0, self.num_prompts, size=bs)
             indices_b = np.random.randint(0, self.num_prompts, size=bs)
-            texts_a = [self.prompts[i] for i in indices_a]
-            texts_b = [self.prompts[i] for i in indices_b]
+            texts_a = [_clean_prompt_text(self.prompts[i]) for i in indices_a]
+            texts_b = [_clean_prompt_text(self.prompts[i]) for i in indices_b]
 
         # ==================================================================
         #查看原始文本

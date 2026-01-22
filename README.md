@@ -38,11 +38,88 @@ python benchmarks/eval_sembenchmark_verified.py   --dataset vCache/SemBenchmarkC
 
 ---
 
+
+
+### Caching Inference (Caching System + HNSW-Multi)
+
+So since the hnsw libraries are with same (our local one and original) it is better to completely create a new directory and conda environment for this caching system, otherwise if you run this installation it would delete the old HNSW which is used for the baseline evaluations.
+
+You need to install the following local library (adjust the path based on your system)
+
+```bash
+python -m pip install -e vcache/vcache_core/cache/embedding_store/hnswlib
+```
+
+
+This is just for verification that we are actually using the HNSW-Multi (Multivector HNSW)
+
+#### 1) Verify the custom APIs are present
+
+```bash
+python - <<'PY'
+import hnswlib
+p = hnswlib.Index(space="ip", dim=4)
+missing = []
+if not hasattr(p, "knn_query_skipping_duplicates_with_parent"):
+    missing.append("knn_query_skipping_duplicates_with_parent")
+print("hnswlib OK" if not missing else f"hnswlib MISSING: {missing}")
+PY
+```
+
+If this prints `hnswlib MISSING: ...`, you’re not importing the custom fork (or it didn’t build).
+
+---
+
+This is the command that is used for evaluation of the script, please pay attention to the arugments (--candidate-selection multivector_top_k \ --candidate-k 10) and for all the evaluation please set the **--sleep** (IT IS VERY IMPORTANT)
+
+#### 2) Run the evaluation (CUDA)
+
+From the repo root:
+
+```bash
+python benchmarks/eval_sembenchmark_verified_splitter.py \
+  --dataset vCache/SemBenchmarkClassification \
+  --llm-col response_llama_3_8b \
+  --delta 0.02 \
+  --similarity-evaluator string \
+  --sleep 0.1 \
+  --splitter-checkpoint /data2/ali/checkpoints_seperate \
+  --candidate-selection multivector_top_k \
+  --candidate-k 10 \
+  --splitter-device cuda \
+  --output-json results/verified_splitter_cuda_multivector.json
+
+```
+
+to test a group of candidate-k and delta,run command like this:
+```bash
+poetry run python benchmarks/eval_sembenchmark_verified_splitter.py \
+  --dataset /home/zhengzishan/Semantic_Caching_MVR/vcahce/datasets/filtered_sembenchmark_train.csv \
+  --llm-col response_llama_3_8b \
+  --deltas 0.01 0.015 0.02 0.03 0.05 0.07 0.08 \
+  --candidate-selection multivector_top_k \
+  --candidate-ks 5 10 \
+  --splitter-checkpoint ~/checkpoints_words/epoch=29-step=1620.ckpt \
+  --splitter-device cuda:3 \
+  --similarity-evaluator string \
+  --sleep 0.1 \
+  --output-json results/local_verified_splitter.json \
+  --benchmark-output-dir results/benchmark_compat \
+  --benchmark-run-index 1
+```
+results/benchmark_compat directory is for the convenience of drawing graphs with benchmark.py.
+
 ## Baselines and Benchmark Scripts
 
 in the benchmark folder there is file called "/vcahce/benchmarks/benchmark.py" in this file there are all the based line that is the original vcache paper, you can create scripts like eval_sembenchmark_verified* and run those baselines on those datasets.
 
+vcahce/benchmarks/eval_sembenchmark_verified_splitter.py (the original version,without new hnswlib) has been intergrated into vcahce/benchmarks/benchmark*.py to automatically generate various comparison graphs.So you can just run benchmark*.py on three datasets.
+
 ---
+
+## Datasets
+The dataset I used for inference has had the training data removed which is located at /data1/wuyinjun/semantic_cache_dataset/dataset/filtered_sembenchmark_classification.csv,/data1/wuyinjun/semantic_cache_dataset/dataset/filtered_SemBenchmarkLmArena_train.csv,/data1/wuyinjun/semantic_cache_dataset/dataset/filtered_SemBenchmarksqArena_train.csv.All datasets for training is also at 
+/data1/wuyinjun/semantic_cache_dataset/dataset/.
 
 ## Environment Variables (Required)
 

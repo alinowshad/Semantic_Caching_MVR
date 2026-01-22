@@ -56,12 +56,15 @@ class AdaptedPointerNetworkPolicy(nn.Module):
                  hidden_dim=128,        
                  max_segments=6,       
                  nhead=4,               
-                 num_encoder_layers=2  
+                 num_encoder_layers=2,
+                 *,
+                 split_words_before: bool = True,
                 ):
         super().__init__()
         self.env = env
         self.hidden_dim = hidden_dim
         self.max_segments = max_segments
+        self.split_words_before = bool(split_words_before)
       
         self.train_decode_type = "sampling"
         self.val_decode_type = "greedy"
@@ -120,6 +123,69 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             self.tokenizer = self.embedding_model.tokenizer
             self.lm = self.embedding_model.model
             self._device = next(self.lm.parameters()).device
+
+        # Additional connector words that can act as split markers (in addition to punctuation).
+        # We will only add those that tokenize to a single token id to avoid splitting inside subwords.
+        self.split_words = [
+            # Coordinating conjunctions
+            # "and",
+            # "or",
+            # "but",
+            # "nor",
+            # "yet",
+            # "so",
+            # Subordinating conjunctions / complementizers
+            # "because",
+            # "although",
+            # "though",
+            # "while",
+            # "whereas",
+            # "if",
+            # "unless",
+            # "since",
+            # "after",
+            # "before",
+            # "when",
+            # "whenever",
+            # "once",
+            # "until",
+            # "as",
+            # Discourse connectives
+            # "however",
+            # "therefore",
+            # "moreover",
+            # "furthermore",
+            # "nevertheless",
+            # "consequently",
+            # "meanwhile",
+            # "instead",
+            # "otherwise",
+            # "likewise",
+            # "similarly",
+        ]
+
+    def _compute_split_candidate_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Base punctuation markers
+        is_punct_global = (
+            torch.isin(input_ids, self._punct_split_ids)
+            if hasattr(self, "_punct_split_ids") and isinstance(self._punct_split_ids, torch.Tensor)
+            else torch.zeros_like(input_ids, dtype=torch.bool)
+        )
+
+        # Optional connector-word markers
+        if hasattr(self, "_connector_split_ids") and isinstance(self._connector_split_ids, torch.Tensor):
+            if int(self._connector_split_ids.numel()) > 0:
+                is_conn = torch.isin(input_ids, self._connector_split_ids)
+                if self.split_words_before:
+                    is_conn_before = torch.zeros_like(is_conn)
+                    is_conn_before[:, :-1] = is_conn[:, 1:]
+                    is_conn_before[:, 0] = False
+                    is_punct_global = is_punct_global | is_conn_before
+                else:
+                    is_punct_global = is_punct_global | is_conn
+
+        return is_punct_global
+
     def _init_punctuation_ids(self, device):
         """
         初始化有效的分割token ID集合。
@@ -138,7 +204,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         
       
         punct_chars = {",", ".", "!", "?", ":", ";", "，", "。", "！", "？", "：", "；"}
-        valid_ids = set()
+        punct_ids = set()
+        connector_ids = set()
 
         # Track special end tokens separately (allowed only at final step)
         end_ids = set()
@@ -151,20 +218,48 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         for char in punct_chars:
             # Case A: 纯标点
             ids = self.tokenizer.encode(char, add_special_tokens=False)
-            if ids: valid_ids.update(ids)
+            if ids: punct_ids.update(ids)
             
             # Case B: 带空格前缀
             ids_space = self.tokenizer.encode(" " + char, add_special_tokens=False)
-            if ids_space: valid_ids.update(ids_space)
+            if ids_space: punct_ids.update(ids_space)
+
+        # Add connector words as split markers (single-token only).
+        for w in getattr(self, "split_words", []) or []:
+            for ww in {w, w.capitalize()}:
+                for prefix in ("", " "):
+                    ids = self.tokenizer.encode(prefix + ww, add_special_tokens=False)
+                    if isinstance(ids, list) and len(ids) == 1:
+                        connector_ids.add(ids[0])
 
      
-        sorted_ids = sorted(list(valid_ids))
-        self._valid_split_ids = torch.tensor(sorted_ids, device=device, dtype=torch.long)
+        sorted_punct_ids = sorted(list(punct_ids))
+        sorted_connector_ids = sorted(list(connector_ids))
+
+        self._punct_split_ids = (
+            torch.tensor(sorted_punct_ids, device=device, dtype=torch.long)
+            if sorted_punct_ids
+            else torch.empty((0,), device=device, dtype=torch.long)
+        )
+        self._connector_split_ids = (
+            torch.tensor(sorted_connector_ids, device=device, dtype=torch.long)
+            if sorted_connector_ids
+            else torch.empty((0,), device=device, dtype=torch.long)
+        )
+
+        sorted_ids = sorted(list(punct_ids | connector_ids))
+        self._valid_split_ids = (
+            torch.tensor(sorted_ids, device=device, dtype=torch.long)
+            if sorted_ids
+            else torch.empty((0,), device=device, dtype=torch.long)
+        )
+      
         self._end_split_ids = (
             torch.tensor(sorted(list(end_ids)), device=device, dtype=torch.long)
             if end_ids
             else None
         )
+
     @property
     def device(self):
         """获取模型所在的设备"""
@@ -257,7 +352,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             self.to(target_device)
             self._current_module_device = target_device
         self._device = target_device
-
+        
+       
         try:
             td = td.to(target_device)
         except Exception:
@@ -288,8 +384,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         c = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device)
         current_b = torch.zeros(batch_size, dtype=torch.long, device=self.device)
 
-        # Base punctuation mask (end tokens handled only at final step)
-        is_punct_base = torch.isin(td[ids_k], self._valid_split_ids)
+        # Base split-marker mask (end tokens handled only at final step)
+        is_punct_base = self._compute_split_candidate_mask(td[ids_k])
 
         pointers = []
         log_probs = []
@@ -437,8 +533,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         
         # --- 3. Decoder 初始化 ---
         decoder_input = self.decoder_start_input.unsqueeze(0).repeat(batch_size, 1)
-        h, c = (torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device),
-                torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device))
+        h = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device)
+        c = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device)
         
         pointers = []
         log_probs = []
@@ -448,8 +544,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         current_bB = torch.zeros(batch_size, dtype=torch.long, device=self.device)
 
         # Precompute base punctuation mask (special end tokens are handled per-step)
-        is_punct_base_a = torch.isin(td["input_ids_a"], self._valid_split_ids)
-        is_punct_base_b = torch.isin(td["input_ids_b"], self._valid_split_ids)
+        is_punct_base_a = self._compute_split_candidate_mask(td["input_ids_a"])
+        is_punct_base_b = self._compute_split_candidate_mask(td["input_ids_b"])
 
         # --- 4. 解码循环 ---
         for step in range(self.max_segments):

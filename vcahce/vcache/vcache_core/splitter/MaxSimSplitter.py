@@ -1,8 +1,11 @@
 import importlib
+import json
+import logging
 import os
 import re
 import sys
 
+import numpy as np
 import torch
 from tensordict.tensordict import TensorDict
 
@@ -97,26 +100,86 @@ def _resolve_checkpoint_path(checkpoint_path: str) -> str:
         return _pick_from_dir(parent)
 
     raise FileNotFoundError(f"Checkpoint path not found: {p}")
+
+
 class MaxSimSplitter:
-    def __init__(self, checkpoint_path, device="cuda", embedding_model=None):
+    def __init__(
+        self,
+        checkpoint_path,
+        device="cuda",
+        embedding_model=None,
+        *,
+        split_words_before: bool = False,
+        debug: bool = False,
+        debug_every_n: int = 1,
+        debug_log_path: str | None = None,
+        debug_max_records: int | None = None,
+    ):
         # Normalize device early so all downstream `.to(...)` calls are consistent.
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
+
+        env_split_words_before = os.environ.get("SPLITTER_SPLIT_WORDS_BEFORE")
+        if env_split_words_before is not None and str(env_split_words_before).strip() != "":
+            try:
+                split_words_before = bool(int(str(env_split_words_before).strip()))
+            except Exception:
+                split_words_before = str(env_split_words_before).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self.split_words_before = bool(split_words_before)
+
+        env_debug = os.environ.get("SPLITTER_DEBUG")
+        if env_debug is not None and str(env_debug).strip() != "":
+            debug = str(env_debug).strip().lower() in {"1", "true", "yes", "y", "on"}
+        env_debug_every_n = os.environ.get("SPLITTER_DEBUG_EVERY_N")
+        if env_debug_every_n is not None and str(env_debug_every_n).strip() != "":
+            try:
+                debug_every_n = int(str(env_debug_every_n).strip())
+            except Exception:
+                pass
+        env_debug_log_path = os.environ.get("SPLITTER_DEBUG_LOG_PATH")
+        if env_debug_log_path is not None and str(env_debug_log_path).strip() != "":
+            debug_log_path = str(env_debug_log_path).strip()
+
+        env_debug_max_records = os.environ.get("SPLITTER_DEBUG_MAX_RECORDS")
+        if env_debug_max_records is not None and str(env_debug_max_records).strip() != "":
+            try:
+                debug_max_records = int(str(env_debug_max_records).strip())
+            except Exception:
+                pass
+
+        self.debug = bool(debug)
+        self.debug_every_n = max(1, int(debug_every_n))
+        self.debug_log_path = debug_log_path
+        self.debug_max_records = debug_max_records
+        self._debug_call_count = 0
+        self._debug_written_records = 0
+        self._debug_max_records_warned = False
+
+        if self.debug:
+            try:
+                logging.info(
+                    "[SPLITTER][init] debug enabled "
+                    f"device={self.device} split_words_before={bool(self.split_words_before)} "
+                    f"debug_every_n={int(self.debug_every_n)} debug_log_path={self.debug_log_path} "
+                    f"debug_max_records={self.debug_max_records}"
+                )
+            except Exception:
+                pass
         resolved_ckpt = _resolve_checkpoint_path(checkpoint_path)
         print(f"正在加载分句模型: {resolved_ckpt} ...")
-        
+
         # 1. 初始化组件
         if embedding_model is not None:
             print("MaxSimSplitter: 复用外部传入的 EmbeddingModel")
             self.embedding_model = embedding_model
         else:
             print("MaxSimSplitter: 未传入 EmbeddingModel，正在创建新实例...")
-            self.embedding_model = EmbeddingModel() 
+            self.embedding_model = EmbeddingModel()
 
         # Ensure the underlying LM is on the requested device *before* constructing the env.
         # RL4CO env init may call the generator once (prints [GEN]) and we want it to reflect the real device.
         if hasattr(self.embedding_model, "model") and hasattr(self.embedding_model.model, "to"):
             self.embedding_model.model.to(self.device)
-        
+
         # Dummy Generator/Env
         # NOTE: MaxSimEnv init may call the generator once (which prints `[GEN] ... device=...`).
         # Move the LM to the target device *before* constructing the env so that call uses CUDA.
@@ -135,43 +198,198 @@ class MaxSimSplitter:
         )
 
         # 2. 初始化 Policy
-        self.policy = AdaptedPointerNetworkPolicy(self.env, embedding_dim=768, hidden_dim=768, max_segments=4)
-        
+        self.policy = AdaptedPointerNetworkPolicy(
+            self.env,
+            embedding_dim=768,
+            hidden_dim=768,
+            max_segments=4,
+            split_words_before=bool(self.split_words_before),
+        )
+
         # =================================================================
-   
+
         original_setstate = RL4COEnvBase.__setstate__
 
-      
         def safe_setstate(obj, state):
             try:
                 original_setstate(obj, state)
             except (TypeError, RuntimeError) as e:
-              
                 pass
 
-     
         RL4COEnvBase.__setstate__ = safe_setstate
 
         try:
             _register_checkpoint_module_aliases()
-            checkpoint = torch.load(resolved_ckpt, map_location='cpu', weights_only=False)
+            # Prefer weights-only loading to avoid unpickling python objects (e.g., numpy RNG state)
+            # that may be incompatible across numpy versions.
+            checkpoint = None
+            try:
+                checkpoint = torch.load(resolved_ckpt, map_location="cpu", weights_only=True)
+            except TypeError:
+                # Older torch without `weights_only`.
+                checkpoint = None
+            except Exception:
+                checkpoint = None
+
+            if checkpoint is None:
+                # Best-effort fallback: patch numpy's bit generator ctor for older pickles.
+                np_pickle = None
+                orig_bitgen_ctor = None
+                try:
+                    import numpy.random._pickle as np_pickle
+
+                    orig_bitgen_ctor = getattr(np_pickle, "__bit_generator_ctor", None)
+                    if callable(orig_bitgen_ctor):
+                        def _compat_bit_generator_ctor(bit_generator_name):
+                            if isinstance(bit_generator_name, type):
+                                bit_generator_name = bit_generator_name.__name__
+                            try:
+                                return orig_bitgen_ctor(bit_generator_name)
+                            except Exception:
+                                # If the name is still unknown, fall back to a default generator.
+                                return orig_bitgen_ctor("PCG64")
+
+                        np_pickle.__bit_generator_ctor = _compat_bit_generator_ctor
+                except Exception:
+                    np_pickle = None
+                    orig_bitgen_ctor = None
+
+                try:
+                    checkpoint = torch.load(resolved_ckpt, map_location="cpu", weights_only=False)
+                finally:
+                    if np_pickle is not None and callable(orig_bitgen_ctor):
+                        np_pickle.__bit_generator_ctor = orig_bitgen_ctor
         finally:
-          
             RL4COEnvBase.__setstate__ = original_setstate
+
         # =================================================================
 
         # 4. 提取并加载权重
-        if "state_dict" in checkpoint:
+        state_dict = None
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
             state_dict = checkpoint["state_dict"]
-            new_state_dict = {k.replace("policy.", ""): v for k, v in state_dict.items() if k.startswith("policy.")}
-            self.policy.load_state_dict(new_state_dict)
+        elif isinstance(checkpoint, dict):
+            # weights_only=True may return a plain state dict.
+            state_dict = checkpoint
+
+        if not isinstance(state_dict, dict) or not state_dict:
+            raise ValueError(f"Checkpoint does not contain a usable state_dict: {type(checkpoint)}")
+
+        if any(str(k).startswith("policy.") for k in state_dict.keys()):
+            new_state_dict = {
+                k.replace("policy.", ""): v
+                for k, v in state_dict.items()
+                if str(k).startswith("policy.")
+            }
         else:
-            print("警告: Checkpoint 中没有 state_dict")
-        
+            new_state_dict = state_dict
+
+        self.policy.load_state_dict(new_state_dict, strict=False)
+
         # 5. 最后再移动到目标设备
         self.policy.to(self.device)
         self.policy.eval()
         print("分句模型加载完成。")
+
+    def _maybe_debug_log(
+        self,
+        *,
+        tag: str,
+        text_a: str,
+        text_b: str,
+        pointers_a: list,
+        pointers_b: list,
+        segments_a: list[str] | None,
+        segments_b: list[str] | None,
+        length_a: int,
+        length_b: int,
+        extra: dict | None = None,
+    ) -> None:
+        if not getattr(self, "debug", False):
+            return
+        self._debug_call_count += 1
+        if (self._debug_call_count % int(getattr(self, "debug_every_n", 1))) != 0:
+            return
+
+        ta = text_a if isinstance(text_a, str) else str(text_a)
+        tb = text_b if isinstance(text_b, str) else str(text_b)
+        ta_preview = ta[:200]
+        tb_preview = tb[:200]
+
+        header = (
+            f"[SPLITTER][{tag}] device={self.device} split_words_before={getattr(self, 'split_words_before', False)} "
+            f"len_a={int(length_a)} len_b={int(length_b)}"
+        )
+        line_pa = f"[SPLITTER][{tag}] pointers_a={pointers_a}"
+        line_pb = f"[SPLITTER][{tag}] pointers_b={pointers_b}"
+        line_sa = f"[SPLITTER][{tag}] segments_a={segments_a}" if segments_a is not None else None
+        line_sb = f"[SPLITTER][{tag}] segments_b={segments_b}" if segments_b is not None else None
+
+        # Always keep console prints (useful when running interactively)
+        print(header)
+        print(line_pa)
+        print(line_pb)
+        if line_sa is not None:
+            print(line_sa)
+        if line_sb is not None:
+            print(line_sb)
+
+        # Also emit to standard Python logging (benchmark4LM config writes this to benchmark4LM.log)
+        try:
+            logging.info(header)
+            logging.info(line_pa)
+            logging.info(line_pb)
+            if line_sa is not None:
+                logging.info(line_sa)
+            if line_sb is not None:
+                logging.info(line_sb)
+        except Exception:
+            # Never let logging failures break inference
+            pass
+
+        if getattr(self, "debug_log_path", None):
+            max_records = getattr(self, "debug_max_records", None)
+            if max_records is not None and self._debug_written_records >= int(max_records):
+                if not getattr(self, "_debug_max_records_warned", False):
+                    print(
+                        f"[SPLITTER][{tag}] reached debug_max_records={int(max_records)}; "
+                        f"stop writing to {self.debug_log_path}"
+                    )
+                    try:
+                        logging.info(
+                            f"[SPLITTER][{tag}] reached debug_max_records={int(max_records)}; "
+                            f"stop writing to {self.debug_log_path}"
+                        )
+                    except Exception:
+                        pass
+                    self._debug_max_records_warned = True
+                return
+            rec = {
+                "tag": str(tag),
+                "device": str(self.device),
+                "split_words_before": bool(getattr(self, "split_words_before", False)),
+                "length_a": int(length_a),
+                "length_b": int(length_b),
+                "pointers_a": list(pointers_a),
+                "pointers_b": list(pointers_b),
+                "segments_a": list(segments_a) if segments_a is not None else None,
+                "segments_b": list(segments_b) if segments_b is not None else None,
+                "text_a_preview": ta_preview,
+                "text_b_preview": tb_preview,
+            }
+            if isinstance(extra, dict) and extra:
+                rec["extra"] = extra
+            try:
+                with open(self.debug_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                self._debug_written_records += 1
+            except Exception as e:
+                print(f"[SPLITTER][{tag}] debug_log_path write failed: {e}")
+                try:
+                    logging.info(f"[SPLITTER][{tag}] debug_log_path write failed: {e}")
+                except Exception:
+                    pass
+
     def split_pair_return_segments(self, text_a, text_b):
         """
         输入：Query 和 Cache Candidate
@@ -222,7 +440,7 @@ class MaxSimSplitter:
                 decode_type="greedy",
                 compute_reward=False,
             )
-        
+
         actions = out['actions'][0] # [2 * max_segments]
 
         # 3. 解析动作 -> 文本片段
@@ -236,7 +454,7 @@ class MaxSimSplitter:
         max_segments = total // 2
         pointers_a = actions[0: 2 * max_segments: 2].tolist()
         pointers_b = actions[1: 2 * max_segments: 2].tolist()
-        
+
         # Reconstruct segments in **token-index space** (pointers are token positions).
         # This avoids the previous mismatch where pointers (token indices) were applied
         # to `prompt.lower().split()` (word indices).
@@ -252,7 +470,19 @@ class MaxSimSplitter:
             attention_mask=attention_mask_b[0],
             pointers=pointers_b,
         )
-        
+
+        self._maybe_debug_log(
+            tag="split_pair_return_segments",
+            text_a=text_a,
+            text_b=text_b,
+            pointers_a=pointers_a,
+            pointers_b=pointers_b,
+            segments_a=segments_a,
+            segments_b=segments_b,
+            length_a=int(attention_mask_a[0].sum().item()),
+            length_b=int(attention_mask_b[0].sum().item()),
+        )
+
         return segments_a, segments_b
 
     def split_pair_return_maxsim_tensors(self, text_a: str, text_b: str):
@@ -322,6 +552,31 @@ class MaxSimSplitter:
         pointers_a = actions[0 : 2 * max_segments : 2].tolist()
         pointers_b = actions[1 : 2 * max_segments : 2].tolist()
 
+        if getattr(self, "debug", False):
+            segments_a = get_segments_from_token_pointers(
+                tokenizer=self.generator.tokenizer,
+                input_ids=inputs["input_ids"][0],
+                attention_mask=inputs["attention_mask"][0] if "attention_mask" in inputs else None,
+                pointers=pointers_a,
+            )
+            segments_b = get_segments_from_token_pointers(
+                tokenizer=self.generator.tokenizer,
+                input_ids=inputs["input_ids"][1],
+                attention_mask=inputs["attention_mask"][1] if "attention_mask" in inputs else None,
+                pointers=pointers_b,
+            )
+            self._maybe_debug_log(
+                tag="split_pair_return_maxsim_tensors",
+                text_a=text_a,
+                text_b=text_b,
+                pointers_a=pointers_a,
+                pointers_b=pointers_b,
+                segments_a=segments_a,
+                segments_b=segments_b,
+                length_a=_length(attn_a, int(token_emb_a.shape[0])),
+                length_b=_length(attn_b, int(token_emb_b.shape[0])),
+            )
+
         def _length(attn, L: int) -> int:
             if attn is None:
                 return int(L)
@@ -330,7 +585,7 @@ class MaxSimSplitter:
             except Exception:
                 return int(L)
 
-        def _segment_embeds(token_emb: torch.Tensor, attn, pointers: list) -> tuple[torch.Tensor, torch.Tensor]:
+        def _segment_embeds(token_emb: torch.Tensor, attn, pointers: list):
             """
             Returns:
               - sentence_embeds: [S, H]
@@ -438,15 +693,6 @@ class MaxSimSplitter:
 
     @staticmethod
     def _segment_embeds_from_pointers(token_emb, length: int, pointers: list):
-        """
-        Convert token-level embeddings + pointer indices into:
-          - sentence_embeds: [S, H] (segment-level mean pooled embeddings)
-          - full_embed:      [1, H] (mean pooled over all tokens excluding CLS)
-        Pointer semantics:
-          - pointers are token positions (0-based)
-          - token 0 is [CLS] and is excluded from pooling
-          - pointer p is an inclusive end boundary => slice ends at p+1
-        """
         import torch
 
         length = max(0, min(int(length), int(token_emb.shape[0])))
@@ -472,8 +718,8 @@ class MaxSimSplitter:
         if not segs:
             segs = [token_emb[1:length, :].mean(dim=0)]
 
-        sentence_embeds = torch.stack(segs, dim=0).to(dtype=torch.float32)  # [S, H]
-        full_embed = token_emb[1:length, :].mean(dim=0, keepdim=True).to(dtype=torch.float32)  # [1, H]
+        sentence_embeds = torch.stack(segs, dim=0).to(dtype=torch.float32)
+        full_embed = token_emb[1:length, :].mean(dim=0, keepdim=True).to(dtype=torch.float32)
         return sentence_embeds, full_embed
 
     def split_text_return_maxsim_tensor_from_encoded(self, enc: dict):
@@ -507,6 +753,28 @@ class MaxSimSplitter:
         if not isinstance(actions, torch.Tensor):
             actions = torch.as_tensor(actions, device=self.device)
         pointers = actions.tolist()
+
+        if getattr(self, "debug", False):
+            try:
+                segments = get_segments_from_token_pointers(
+                    tokenizer=self.generator.tokenizer,
+                    input_ids=ids,
+                    attention_mask=am,
+                    pointers=pointers,
+                )
+            except Exception:
+                segments = None
+            self._maybe_debug_log(
+                tag="split_text_return_maxsim_tensor_from_encoded",
+                text_a="",
+                text_b="",
+                pointers_a=pointers,
+                pointers_b=[],
+                segments_a=segments,
+                segments_b=None,
+                length_a=int(length),
+                length_b=0,
+            )
 
         sent, full = self._segment_embeds_from_pointers(tok, length, pointers)
         return torch.cat([sent, full], dim=0)
@@ -597,6 +865,31 @@ class MaxSimSplitter:
 
         query_tensor = torch.cat([sent_a, full_a], dim=0)
         corpus_tensor = torch.cat([sent_b, full_b], dim=0)
+
+        if getattr(self, "debug", False):
+            segments_a = get_segments_from_token_pointers(
+                tokenizer=self.generator.tokenizer,
+                input_ids=ids_a,
+                attention_mask=am_a,
+                pointers=pointers_a,
+            )
+            segments_b = get_segments_from_token_pointers(
+                tokenizer=self.generator.tokenizer,
+                input_ids=ids_b,
+                attention_mask=am_b,
+                pointers=pointers_b,
+            )
+            self._maybe_debug_log(
+                tag="split_pair_return_maxsim_tensors_from_encoded",
+                text_a="",
+                text_b="",
+                pointers_a=pointers_a,
+                pointers_b=pointers_b,
+                segments_a=segments_a,
+                segments_b=segments_b,
+                length_a=int(la),
+                length_b=int(lb),
+            )
         return query_tensor, corpus_tensor
 
     def debug_split_pair(self, text_a: str, text_b: str) -> dict:

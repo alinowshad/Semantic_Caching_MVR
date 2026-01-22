@@ -21,6 +21,233 @@ from benchmarks._plotter_helper import (
 )
 
 
+def __normalize_float_key_str(float_val: float) -> str:
+    key_str = f"{float_val:.3f}".rstrip("0").rstrip(".")
+    if not key_str and float_val == 0:
+        key_str = "0"
+    return key_str
+
+
+def __collect_splitter_run_dirs_by_delta_and_config(results_dir_path: str):
+    mapping: Dict[float, Dict[str, List[str]]] = {}
+    if not os.path.exists(results_dir_path):
+        return mapping
+
+    pat = re.compile(
+        r"^vcache_splitter_(?P<delta>[0-9]+\.?[0-9]*|[0-9]*\.?[0-9]+)_(?P<sel>top_k|all)_(?P<k>[^_]+)_run_(?P<run>\d+)$"
+    )
+
+    for dir_name in os.listdir(results_dir_path):
+        full_dir_path = os.path.join(results_dir_path, dir_name)
+        if not os.path.isdir(full_dir_path):
+            continue
+        m = pat.match(dir_name)
+        if not m:
+            continue
+
+        try:
+            delta_val = float(m.group("delta"))
+        except Exception:
+            continue
+
+        sel = m.group("sel")
+        k = m.group("k")
+        config_key = f"{sel}|{k}"
+        mapping.setdefault(delta_val, {}).setdefault(config_key, []).append(full_dir_path)
+
+    return mapping
+
+
+def __try_parse_numeric(val: str):
+    try:
+        if isinstance(val, str) and val.strip().isdigit():
+            return int(val.strip())
+    except Exception:
+        pass
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
+def __plot_splitter_k_sweep_for_deltas(
+    *,
+    results_dir: str,
+    splitter_dirs_by_delta_cfg: Dict[float, Dict[str, List[str]]],
+    timestamp: str,
+    font_size: int,
+):
+    # Only plot when a delta has multiple configs (typically multiple k values).
+    if not splitter_dirs_by_delta_cfg:
+        return
+
+    for delta_val, cfg_map in splitter_dirs_by_delta_cfg.items():
+        if not cfg_map or len(cfg_map) <= 1:
+            continue
+
+        # Build per-selection series (top_k vs all) over k.
+        per_sel: Dict[str, List[Dict[str, float | int | str]]] = {}
+        for cfg_key, run_dirs in cfg_map.items():
+            try:
+                sel, k_raw = str(cfg_key).split("|", 1)
+            except Exception:
+                sel, k_raw = "unknown", str(cfg_key)
+
+            stats = __aggregate_stats_for_cache_hit_error_rate(run_dirs)
+            k_num = __try_parse_numeric(str(k_raw))
+            per_sel.setdefault(sel, []).append(
+                {
+                    "k_raw": str(k_raw),
+                    "k_num": k_num,
+                    "cache_hit_rate_mean": float(stats.get("cache_hit_rate_mean", 0.0)),
+                    "cache_hit_rate_ci_low": float(stats.get("cache_hit_rate_ci_low", 0.0)),
+                    "cache_hit_rate_ci_up": float(stats.get("cache_hit_rate_ci_up", 0.0)),
+                    "error_rate_mean": float(stats.get("error_rate_mean", 0.0)),
+                    "error_rate_ci_low": float(stats.get("error_rate_ci_low", 0.0)),
+                    "error_rate_ci_up": float(stats.get("error_rate_ci_up", 0.0)),
+                }
+            )
+
+        # If we still effectively only have one k (e.g., multiple runs same k), skip.
+        total_unique_k = set()
+        for sel, rows in per_sel.items():
+            for r in rows:
+                total_unique_k.add(r.get("k_raw"))
+        if len(total_unique_k) <= 1:
+            continue
+
+        def _sort_key(row):
+            k_num = row.get("k_num")
+            if isinstance(k_num, (int, float)):
+                return (0, float(k_num))
+            return (1, str(row.get("k_raw")))
+
+        for sel in list(per_sel.keys()):
+            per_sel[sel] = sorted(per_sel[sel], key=_sort_key)
+
+        # Collect numeric k values only (k-sweep). Non-numeric entries like "all" are skipped.
+        k_numeric_all: List[float] = []
+        for _sel, rows in per_sel.items():
+            for r in rows:
+                k_num = r.get("k_num")
+                if isinstance(k_num, (int, float)) and not np.isnan(float(k_num)):
+                    k_numeric_all.append(float(k_num))
+
+        if not k_numeric_all:
+            continue
+
+        # For the sensitivity analysis we only want K=1..10 on the x-axis.
+        k_sweep_min = 1
+        k_sweep_max = 10
+        xticks = list(range(k_sweep_min, k_sweep_max + 1))
+
+        delta_str = __normalize_float_key_str(float(delta_val))
+
+        # -------- Plot 1: Cache Hit Rate vs k --------
+        plt.figure(figsize=(12, 11))
+        plt.rcParams.update({"font.size": font_size})
+
+        ymins: List[float] = []
+        ymaxs: List[float] = []
+        for sel, rows in per_sel.items():
+            rows_num = [
+                r
+                for r in rows
+                if isinstance(r.get("k_num"), (int, float))
+                and not np.isnan(float(r["k_num"]))
+                and k_sweep_min <= float(r["k_num"]) <= k_sweep_max
+            ]
+            if not rows_num:
+                continue
+            xs = [float(r["k_num"]) for r in rows_num]
+            ys = [float(r["cache_hit_rate_mean"]) for r in rows_num]
+            ylo = [float(r["cache_hit_rate_ci_low"]) for r in rows_num]
+            yhi = [float(r["cache_hit_rate_ci_up"]) for r in rows_num]
+            plt.plot(xs, ys, marker="o", label=str(sel))
+            try:
+                plt.fill_between(xs, ylo, yhi, alpha=0.15)
+            except Exception:
+                pass
+            ymins.extend(ylo)
+            ymaxs.extend(yhi)
+
+        if ymins and ymaxs:
+            ymin = float(min(ymins))
+            ymax = float(max(ymaxs))
+            span = max(1e-9, ymax - ymin)
+            pad = max(0.005, 0.1 * span)
+            plt.ylim(max(0.0, ymin - pad), min(1.0, ymax + pad))
+
+        plt.xlim(k_sweep_min - 0.5, k_sweep_max + 0.5)
+        x_tick_fs = min(12, max(6, int(font_size * 0.4)))
+        plt.xticks(xticks, [str(k) for k in xticks], fontsize=x_tick_fs)
+        plt.tick_params(axis="x", pad=2)
+        plt.xlabel("candidate_k")
+        plt.ylabel("Cache Hit Rate")
+        plt.title(f"vCache Splitter: Cache Hit Rate vs k (delta={delta_str})")
+        plt.grid(True, alpha=0.2)
+        plt.legend()
+        plt.tight_layout()
+        out1 = os.path.join(
+            results_dir,
+            f"vcache_splitter_k_sweep_cache_hit_delta_{delta_str}_{timestamp}.pdf",
+        )
+        plt.savefig(out1, format="pdf", bbox_inches="tight", transparent=True)
+        plt.close()
+
+        # -------- Plot 2: Error Rate vs k --------
+        plt.figure(figsize=(12, 11))
+        plt.rcParams.update({"font.size": font_size})
+
+        ymins = []
+        ymaxs = []
+        for sel, rows in per_sel.items():
+            rows_num = [
+                r
+                for r in rows
+                if isinstance(r.get("k_num"), (int, float))
+                and not np.isnan(float(r["k_num"]))
+                and k_sweep_min <= float(r["k_num"]) <= k_sweep_max
+            ]
+            if not rows_num:
+                continue
+            xs = [float(r["k_num"]) for r in rows_num]
+            ys = [float(r["error_rate_mean"]) for r in rows_num]
+            ylo = [float(r["error_rate_ci_low"]) for r in rows_num]
+            yhi = [float(r["error_rate_ci_up"]) for r in rows_num]
+            plt.plot(xs, ys, marker="o", label=str(sel))
+            try:
+                plt.fill_between(xs, ylo, yhi, alpha=0.15)
+            except Exception:
+                pass
+            ymins.extend(ylo)
+            ymaxs.extend(yhi)
+
+        if ymins and ymaxs:
+            ymin = float(min(ymins))
+            ymax = float(max(ymaxs))
+            span = max(1e-9, ymax - ymin)
+            pad = max(0.005, 0.1 * span)
+            plt.ylim(max(0.0, ymin - pad), min(1.0, ymax + pad))
+
+        plt.xlim(k_sweep_min - 0.5, k_sweep_max + 0.5)
+        x_tick_fs = min(12, max(6, int(font_size * 0.4)))
+        plt.xticks(xticks, [str(k) for k in xticks], fontsize=x_tick_fs)
+        plt.tick_params(axis="x", pad=2)
+        plt.xlabel("candidate_k")
+        plt.ylabel("Error Rate")
+        plt.title(f"vCache Splitter: Error Rate vs k (delta={delta_str})")
+        plt.grid(True, alpha=0.2)
+        plt.legend()
+        plt.tight_layout()
+        out2 = os.path.join(
+            results_dir,
+            f"vcache_splitter_k_sweep_error_rate_delta_{delta_str}_{timestamp}.pdf",
+        )
+        plt.savefig(out2, format="pdf", bbox_inches="tight", transparent=True)
+        plt.close()
+
+
 def __calculate_mean_and_ci_from_runs(
     per_run_values: List[float],
     z: float = 1.96,
@@ -381,10 +608,11 @@ def __aggregate_stats_for_cache_hit_error_rate(run_dirs: List[str], z: float = 1
 def __get_result_files(results_dir: str):
     if not os.path.exists(results_dir):
         print(f"No results found in {results_dir}")
-        return [], [], [], [], [], [], []
+        return [], [], [], [], [], [], [], []
 
     gptcache_files: List[str] = []
     vcache_local_files: List[str] = []
+    vcache_splitter_files: List[str] = []
     vcache_global_files: List[str] = []
     berkeley_embedding_files: List[str] = []
     vcache_berkeley_embedding_files: List[str] = []
@@ -409,6 +637,14 @@ def __get_result_files(results_dir: str):
             for file in os.listdir(dir_path):
                 if file.startswith("results_") and file.endswith(".json"):
                     vcache_local_files.append(os.path.join(dir_path, file))
+
+        elif d.startswith("vcache_splitter_") and os.path.isdir(
+            os.path.join(results_dir, d)
+        ):
+            dir_path: str = os.path.join(results_dir, d)
+            for file in os.listdir(dir_path):
+                if file.startswith("results_") and file.endswith(".json"):
+                    vcache_splitter_files.append(os.path.join(dir_path, file))
 
         # Process vCache global directories
         elif (
@@ -458,6 +694,7 @@ def __get_result_files(results_dir: str):
     return (
         gptcache_files,
         vcache_local_files,
+        vcache_splitter_files,
         vcache_global_files,
         berkeley_embedding_files,
         vcache_berkeley_embedding_files,
@@ -475,13 +712,28 @@ def generate_combined_plots(
     font_size: int,
     keep_split: int = 100,
 ):
-    results_dir: str = (
-        f"{results_dir}/{dataset}/{embedding_model_name}/{llm_model_name}/"
-    )
+    resolved_dataset = dataset
+    results_dir: str = f"{results_dir}/{resolved_dataset}/{embedding_model_name}/{llm_model_name}/"
+
+    if not os.path.exists(results_dir):
+        alt_datasets: List[str] = []
+        if resolved_dataset.endswith(".csv") or resolved_dataset.endswith(".parquet"):
+            alt_datasets.append(os.path.splitext(resolved_dataset)[0])
+        else:
+            alt_datasets.append(resolved_dataset + ".csv")
+            alt_datasets.append(resolved_dataset + ".parquet")
+
+        for alt_ds in alt_datasets:
+            alt_dir = f"{os.path.dirname(os.path.dirname(results_dir))}/{alt_ds}/{embedding_model_name}/{llm_model_name}/"
+            if os.path.exists(alt_dir):
+                resolved_dataset = alt_ds
+                results_dir = alt_dir
+                break
 
     (
         gptcache_files,
         vcache_local_files,
+        vcache_splitter_files,
         vcache_global_files,
         berkeley_embedding_files,
         vcache_berkeley_embedding_files,
@@ -492,6 +744,7 @@ def generate_combined_plots(
     if (
         not gptcache_files
         and not vcache_local_files
+        and not vcache_splitter_files
         and not vcache_global_files
         and not berkeley_embedding_files
         and not vcache_berkeley_embedding_files
@@ -539,6 +792,87 @@ def generate_combined_plots(
         except Exception as e:
             print(f"Error loading {vcache_local_file_path}: {e}")
             continue
+
+    ############################################################
+    ### Baseline: vCache Splitter
+    # Support multiple splitter configs (top_k/all, candidate_k sweeps):
+    # select best config per delta and only plot that.
+    vcache_splitter_data_frames: Dict[float, pd.DataFrame] = {}
+    vcache_splitter_run_dirs_map_override: Dict[str, List[str]] | None = None
+
+    splitter_dirs_by_delta_cfg = __collect_splitter_run_dirs_by_delta_and_config(
+        results_dir
+    )
+    if splitter_dirs_by_delta_cfg:
+        __plot_splitter_k_sweep_for_deltas(
+            results_dir=results_dir,
+            splitter_dirs_by_delta_cfg=splitter_dirs_by_delta_cfg,
+            timestamp=timestamp,
+            font_size=font_size,
+        )
+        vcache_splitter_run_dirs_map_override = {}
+        for delta_val, cfg_map in splitter_dirs_by_delta_cfg.items():
+            best_cfg = None
+            best_stats = None
+            for cfg_key, run_dirs in cfg_map.items():
+                stats = __aggregate_stats_for_cache_hit_error_rate(run_dirs)
+                if best_stats is None:
+                    best_stats = stats
+                    best_cfg = cfg_key
+                    continue
+
+                # Prefer higher cache hit rate; tie-breaker lower error rate.
+                if stats["cache_hit_rate_mean"] > best_stats["cache_hit_rate_mean"]:
+                    best_stats = stats
+                    best_cfg = cfg_key
+                elif stats["cache_hit_rate_mean"] == best_stats["cache_hit_rate_mean"]:
+                    if stats["error_rate_mean"] < best_stats["error_rate_mean"]:
+                        best_stats = stats
+                        best_cfg = cfg_key
+
+            if best_cfg is None:
+                continue
+
+            selected_run_dirs = cfg_map.get(best_cfg, [])
+            if not selected_run_dirs:
+                continue
+
+            key_str = __normalize_float_key_str(float(delta_val))
+            vcache_splitter_run_dirs_map_override[key_str] = selected_run_dirs
+
+            # Load a representative dataframe for this delta from the first selected run dir.
+            loaded_df = None
+            for file_name in os.listdir(selected_run_dirs[0]):
+                if file_name.startswith("results_") and file_name.endswith(".json"):
+                    try:
+                        with open(
+                            os.path.join(selected_run_dirs[0], file_name), "r"
+                        ) as f:
+                            data: Any = json.load(f)
+                        loaded_df, _, chopped_index = convert_to_dataframe_from_json_file(
+                            json_data=data, keep_split=keep_split
+                        )
+                        break
+                    except Exception:
+                        loaded_df = None
+                        continue
+            if loaded_df is not None:
+                vcache_splitter_data_frames[float(delta_val)] = loaded_df
+    else:
+        # Backward-compatible path (single splitter config): keep existing behavior.
+        for vcache_splitter_file_path in vcache_splitter_files:
+            try:
+                with open(vcache_splitter_file_path, "r") as f:
+                    data: Any = json.load(f)
+                    dataframe, _, chopped_index = convert_to_dataframe_from_json_file(
+                        json_data=data, keep_split=keep_split
+                    )
+                    delta: float = data["config"]["delta"]
+                    vcache_splitter_data_frames[delta] = dataframe
+                    chopped_index = chopped_index
+            except Exception as e:
+                print(f"Error loading {vcache_splitter_file_path}: {e}")
+                continue
 
     ############################################################
     ### Baseline: vCache Global
@@ -634,6 +968,7 @@ def generate_combined_plots(
     __plot_legend(
         gptcache_data_frames=gptcache_data_frames,
         vcache_local_data_frames=vcache_local_data_frames,
+        vcache_splitter_data_frames=vcache_splitter_data_frames,
         vcache_global_data_frames=vcache_global_data_frames,
         berkeley_embedding_data_frames=berkeley_embedding_data_frames,
         vcache_berkeley_embedding_data_frames=vcache_berkeley_embedding_data_frames,
@@ -648,6 +983,7 @@ def generate_combined_plots(
         __plot_roc(
             gptcache_data_frames=gptcache_data_frames,
             vcache_local_data_frames=vcache_local_data_frames,
+            vcache_splitter_data_frames=vcache_splitter_data_frames,
             vcache_global_data_frames=vcache_global_data_frames,
             berkeley_embedding_data_frames=berkeley_embedding_data_frames,
             vcache_berkeley_embedding_data_frames=vcache_berkeley_embedding_data_frames,
@@ -656,6 +992,7 @@ def generate_combined_plots(
             font_size=font_size,
             keep_split=keep_split,
             chopped_index=chopped_index,
+            vcache_splitter_run_dirs_map_override=vcache_splitter_run_dirs_map_override,
         )
     except Exception as e:
         print(f"Error plotting ROC: {e}")
@@ -664,6 +1001,7 @@ def generate_combined_plots(
         __plot_precision_vs_recall(
             gptcache_data_frames=gptcache_data_frames,
             vcache_local_data_frames=vcache_local_data_frames,
+            vcache_splitter_data_frames=vcache_splitter_data_frames,
             vcache_global_data_frames=vcache_global_data_frames,
             berkeley_embedding_data_frames=berkeley_embedding_data_frames,
             vcache_berkeley_embedding_data_frames=vcache_berkeley_embedding_data_frames,
@@ -671,6 +1009,7 @@ def generate_combined_plots(
             timestamp=timestamp,
             font_size=font_size,
             chopped_index=chopped_index,
+            vcache_splitter_run_dirs_map_override=vcache_splitter_run_dirs_map_override,
         )
     except Exception as e:
         print(f"Error plotting precision vs recall: {e}")
@@ -679,6 +1018,7 @@ def generate_combined_plots(
         __plot_avg_latency_vs_error_rate(
             gptcache_data_frames=gptcache_data_frames,
             vcache_local_data_frames=vcache_local_data_frames,
+            vcache_splitter_data_frames=vcache_splitter_data_frames,
             vcache_global_data_frames=vcache_global_data_frames,
             berkeley_embedding_data_frames=berkeley_embedding_data_frames,
             vcache_berkeley_embedding_data_frames=vcache_berkeley_embedding_data_frames,
@@ -688,6 +1028,7 @@ def generate_combined_plots(
             timestamp=timestamp,
             font_size=font_size,
             chopped_index=chopped_index,
+            vcache_splitter_run_dirs_map_override=vcache_splitter_run_dirs_map_override,
         )
     except Exception as e:
         print(f"Error plotting avg latency vs error rate: {e}")
@@ -696,6 +1037,7 @@ def generate_combined_plots(
         __plot_cache_hit_vs_error_rate(
             gptcache_data_frames=gptcache_data_frames,
             vcache_local_data_frames=vcache_local_data_frames,
+            vcache_splitter_data_frames=vcache_splitter_data_frames,
             vcache_global_data_frames=vcache_global_data_frames,
             berkeley_embedding_data_frames=berkeley_embedding_data_frames,
             vcache_berkeley_embedding_data_frames=vcache_berkeley_embedding_data_frames,
@@ -705,6 +1047,7 @@ def generate_combined_plots(
             timestamp=timestamp,
             font_size=font_size,
             chopped_index=chopped_index,
+            vcache_splitter_run_dirs_map_override=vcache_splitter_run_dirs_map_override,
         )
     except Exception as e:
         print(f"Error plotting cache hit vs error rate: {e}")
@@ -713,6 +1056,7 @@ def generate_combined_plots(
         __plot_cache_hit_vs_error_rate_vs_sample_size(
             gptcache_data_frames=gptcache_data_frames,
             vcache_local_data_frames=vcache_local_data_frames,
+            vcache_splitter_data_frames=vcache_splitter_data_frames,
             vcache_global_data_frames=vcache_global_data_frames,
             berkeley_embedding_data_frames=berkeley_embedding_data_frames,
             vcache_berkeley_embedding_data_frames=vcache_berkeley_embedding_data_frames,
@@ -721,6 +1065,7 @@ def generate_combined_plots(
             font_size=font_size,
             keep_split=keep_split,
             chopped_index=chopped_index,
+            vcache_splitter_run_dirs_map_override=vcache_splitter_run_dirs_map_override,
         )
     except Exception as e:
         print(f"Error plotting cache hit vs error rate vs sample size: {e}")
@@ -728,12 +1073,14 @@ def generate_combined_plots(
     try:
         __plot_delta_accuracy(
             vcache_local_data_frames=vcache_local_data_frames,
+            vcache_splitter_data_frames=vcache_splitter_data_frames,
             vcache_global_data_frames=vcache_global_data_frames,
             vcache_berkeley_embedding_data_frames=vcache_berkeley_embedding_data_frames,
             results_dir=results_dir,
             timestamp=timestamp,
             font_size=font_size,
             chopped_index=chopped_index,
+            vcache_splitter_run_dirs_map_override=vcache_splitter_run_dirs_map_override,
         )
     except Exception as e:
         print(f"Error plotting delta accuracy: {e}")
@@ -742,6 +1089,7 @@ def generate_combined_plots(
 def __plot_legend(
     gptcache_data_frames: Dict[float, pd.DataFrame],
     vcache_local_data_frames: Dict[float, pd.DataFrame],
+    vcache_splitter_data_frames: Dict[float, pd.DataFrame],
     vcache_global_data_frames: Dict[float, pd.DataFrame],
     berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
     vcache_berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
@@ -785,6 +1133,20 @@ def __plot_legend(
             )
         )
         labels.append("vCache")
+
+    if vcache_splitter_data_frames:
+        lines.append(
+            Line2D(
+                [0],
+                [0],
+                color="#9B59B6",
+                linewidth=3,
+                linestyle="-",
+                marker="o",
+                markersize=8,
+            )
+        )
+        labels.append("vCache (Splitter)")
 
     if vcache_global_data_frames:
         lines.append(
@@ -882,6 +1244,7 @@ def __plot_legend(
 def __plot_roc(
     gptcache_data_frames: Dict[float, pd.DataFrame],
     vcache_local_data_frames: Dict[float, pd.DataFrame],
+    vcache_splitter_data_frames: Dict[float, pd.DataFrame],
     vcache_global_data_frames: Dict[float, pd.DataFrame],
     berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
     vcache_berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
@@ -890,6 +1253,7 @@ def __plot_roc(
     font_size: int,
     keep_split: int,
     chopped_index: int,
+    vcache_splitter_run_dirs_map_override: Dict[str, List[str]] | None = None,
 ):
     plt.figure(figsize=(12, 10))
 
@@ -903,6 +1267,11 @@ def __plot_roc(
     )
     vcache_local_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_local_"
+    )
+    vcache_splitter_run_dirs_map = (
+        vcache_splitter_run_dirs_map_override
+        if vcache_splitter_run_dirs_map_override is not None
+        else __collect_run_dirs_by_prefix_and_key(results_dir, "vcache_splitter_")
     )
     vcache_global_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_global_"
@@ -1029,6 +1398,29 @@ def __plot_roc(
         )
 
     ############################################################
+    ### Baseline: vCache Splitter
+    if vcache_splitter_data_frames:
+        vs_fpr, vs_tpr, vs_fpr_le, vs_fpr_ue, vs_tpr_le, vs_tpr_ue, vs_multi = (
+            prepare_roc_series_data(
+                data_frames=vcache_splitter_data_frames,
+                run_dirs_map_for_series=vcache_splitter_run_dirs_map,
+                keep_split=keep_split,
+            )
+        )
+        __draw_confidence_series(
+            vs_fpr,
+            vs_tpr,
+            vs_fpr_le,
+            vs_fpr_ue,
+            vs_tpr_le,
+            vs_tpr_ue,
+            vs_multi,
+            "#9B59B6",
+            "vCache (Splitter)",
+            10,
+        )
+
+    ############################################################
     ### Baseline: vCache Global
     if vcache_global_data_frames:
         vg_fpr, vg_tpr, vg_fpr_le, vg_fpr_ue, vg_tpr_le, vg_tpr_ue, vg_multi = (
@@ -1120,6 +1512,7 @@ def __plot_roc(
 def __plot_precision_vs_recall(
     gptcache_data_frames: Dict[float, pd.DataFrame],
     vcache_local_data_frames: Dict[float, pd.DataFrame],
+    vcache_splitter_data_frames: Dict[float, pd.DataFrame],
     vcache_global_data_frames: Dict[float, pd.DataFrame],
     berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
     vcache_berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
@@ -1127,6 +1520,7 @@ def __plot_precision_vs_recall(
     timestamp: str,
     font_size: int,
     chopped_index: int,
+    vcache_splitter_run_dirs_map_override: Dict[str, List[str]] | None = None,
 ):
     plt.figure(figsize=(12, 8))
 
@@ -1194,6 +1588,44 @@ def __plot_precision_vs_recall(
             plt.annotate(
                 text="",
                 xy=(vcache_local_recall_values[i], vcache_local_precision_values[i]),
+                textcoords="offset points",
+                xytext=(0, 10),
+                ha="center",
+                fontsize=font_size - 4,
+            )
+
+    ############################################################
+    ### Baseline: vCache Splitter
+    if vcache_splitter_data_frames:
+        vcache_splitter_deltas = sorted(vcache_splitter_data_frames.keys())
+        vcache_splitter_precision_values = []
+        vcache_splitter_recall_values = []
+
+        for delta in vcache_splitter_deltas:
+            df = vcache_splitter_data_frames[delta]
+            precision = compute_precision_score(tp=df["tp_list"], fp=df["fp_list"])
+            recall = compute_recall_score(tp=df["tp_list"], fn=df["fn_list"])
+
+            vcache_splitter_precision_values.append(precision)
+            vcache_splitter_recall_values.append(recall)
+
+        plt.plot(
+            vcache_splitter_recall_values,
+            vcache_splitter_precision_values,
+            "o-",
+            color="#9B59B6",
+            linewidth=3,
+            label="vCache (Splitter)",
+            markersize=8,
+        )
+
+        for i, _ in enumerate(vcache_splitter_precision_values):
+            plt.annotate(
+                text="",
+                xy=(
+                    vcache_splitter_recall_values[i],
+                    vcache_splitter_precision_values[i],
+                ),
                 textcoords="offset points",
                 xytext=(0, 10),
                 ha="center",
@@ -1338,6 +1770,7 @@ def __plot_precision_vs_recall(
 def __plot_avg_latency_vs_error_rate(
     gptcache_data_frames: Dict[float, pd.DataFrame],
     vcache_local_data_frames: Dict[float, pd.DataFrame],
+    vcache_splitter_data_frames: Dict[float, pd.DataFrame],
     vcache_global_data_frames: Dict[float, pd.DataFrame],
     berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
     vcache_berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
@@ -1347,6 +1780,7 @@ def __plot_avg_latency_vs_error_rate(
     timestamp: str,
     font_size: int,
     chopped_index: int,
+    vcache_splitter_run_dirs_map_override: Dict[str, List[str]] | None = None,
 ):
     plt.figure(figsize=(12, 10))
     ERROR_RATE_UPPER_BOUND = 6  # 6%
@@ -1357,6 +1791,11 @@ def __plot_avg_latency_vs_error_rate(
     )
     vcache_local_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_local_"
+    )
+    vcache_splitter_run_dirs_map = (
+        vcache_splitter_run_dirs_map_override
+        if vcache_splitter_run_dirs_map_override is not None
+        else __collect_run_dirs_by_prefix_and_key(results_dir, "vcache_splitter_")
     )
     vcache_global_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_global_"
@@ -1502,6 +1941,29 @@ def __plot_avg_latency_vs_error_rate(
             vl_multi,
             "#37A9EC",
             "vCache",
+            8,
+        )
+
+    ############################################################
+    ### Baseline: vCache Splitter
+    if vcache_splitter_data_frames:
+        vs_lat, vs_err, vs_lat_le, vs_lat_ue, vs_err_le, vs_err_ue, vs_multi = (
+            prepare_latency_error_series_data(
+                vcache_splitter_data_frames,
+                vcache_splitter_run_dirs_map,
+                ERROR_RATE_UPPER_BOUND,
+            )
+        )
+        __draw_confidence_series(
+            vs_lat,
+            vs_err,
+            vs_lat_le,
+            vs_lat_ue,
+            vs_err_le,
+            vs_err_ue,
+            vs_multi,
+            "#9B59B6",
+            "vCache (Splitter)",
             8,
         )
 
@@ -1655,6 +2117,7 @@ def __plot_avg_latency_vs_error_rate(
 def __plot_cache_hit_vs_error_rate(
     gptcache_data_frames: Dict[float, pd.DataFrame],
     vcache_local_data_frames: Dict[float, pd.DataFrame],
+    vcache_splitter_data_frames: Dict[float, pd.DataFrame],
     vcache_global_data_frames: Dict[float, pd.DataFrame],
     berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
     vcache_berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
@@ -1664,6 +2127,7 @@ def __plot_cache_hit_vs_error_rate(
     timestamp: str,
     font_size: int,
     chopped_index: int,
+    vcache_splitter_run_dirs_map_override: Dict[str, List[str]] | None = None,
 ):
     plt.figure(figsize=(12, 10))
     ERROR_RATE_UPPER_BOUND = 8  # 6%
@@ -1674,6 +2138,11 @@ def __plot_cache_hit_vs_error_rate(
     )
     vcache_local_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_local_"
+    )
+    vcache_splitter_run_dirs_map = (
+        vcache_splitter_run_dirs_map_override
+        if vcache_splitter_run_dirs_map_override is not None
+        else __collect_run_dirs_by_prefix_and_key(results_dir, "vcache_splitter_")
     )
     vcache_global_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_global_"
@@ -1810,6 +2279,28 @@ def __plot_cache_hit_vs_error_rate(
             8,
         )
 
+    # vCache Splitter
+    if vcache_splitter_data_frames:
+        vs_err, vs_ch, vs_err_le, vs_err_ue, vs_ch_le, vs_ch_ue, vs_multi = (
+            prepare_cache_hit_error_series_data(
+                vcache_splitter_data_frames,
+                vcache_splitter_run_dirs_map,
+                ERROR_RATE_UPPER_BOUND,
+            )
+        )
+        __draw_confidence_series(
+            vs_err,
+            vs_ch,
+            vs_err_le,
+            vs_err_ue,
+            vs_ch_le,
+            vs_ch_ue,
+            vs_multi,
+            "#9B59B6",
+            "vCache (Splitter)",
+            8,
+        )
+
     # vCache Global
     if vcache_global_data_frames:
         vg_err, vg_ch, vg_err_le, vg_err_ue, vg_ch_le, vg_ch_ue, vg_multi = (
@@ -1939,6 +2430,7 @@ def __plot_cache_hit_vs_error_rate(
 def __plot_cache_hit_vs_error_rate_vs_sample_size(
     gptcache_data_frames: Dict[float, pd.DataFrame],
     vcache_local_data_frames: Dict[float, pd.DataFrame],
+    vcache_splitter_data_frames: Dict[float, pd.DataFrame],
     vcache_global_data_frames: Dict[float, pd.DataFrame],
     berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
     vcache_berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
@@ -1947,16 +2439,19 @@ def __plot_cache_hit_vs_error_rate_vs_sample_size(
     font_size: int,
     keep_split: int,
     chopped_index: int,
+    vcache_splitter_run_dirs_map_override: Dict[str, List[str]] | None = None,
 ):
-    target_deltas = [0.015, 0.02, 0.02, 0.03, 0.03, 0.03]
-    target_error_rates = [2, 2, 2.5, 2.5, 3, 3.5]
-
     # Collect all run directories once
     gptcache_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "gptcache_"
     )
     vcache_local_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_local_"
+    )
+    vcache_splitter_run_dirs_map = (
+        vcache_splitter_run_dirs_map_override
+        if vcache_splitter_run_dirs_map_override is not None
+        else __collect_run_dirs_by_prefix_and_key(results_dir, "vcache_splitter_")
     )
     vcache_global_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_global_"
@@ -1967,6 +2462,24 @@ def __plot_cache_hit_vs_error_rate_vs_sample_size(
     vcache_berkeley_embedding_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
         results_dir, "vcache_berkeley_embedding_"
     )
+
+    # Use all deltas that actually exist in the results.
+    # Target error rate for each delta is the *actual* vCache Local error rate.
+    target_deltas = []
+    target_error_rates = []
+    for delta_val in sorted(vcache_local_data_frames.keys()):
+        delta_key_str = __normalize_float_key_str(delta_val)
+        local_run_dirs = vcache_local_run_dirs_map.get(delta_key_str, [])
+        if len(local_run_dirs) > 1:
+            stats = __aggregate_stats_for_cache_hit_error_rate(local_run_dirs)
+            if stats is None:
+                continue
+            target_deltas.append(delta_val)
+            target_error_rates.append(stats["error_rate_mean"] * 100)
+        else:
+            df = vcache_local_data_frames[delta_val]
+            target_deltas.append(delta_val)
+            target_error_rates.append(compute_error_rate_score(fp=df["fp_list"]) * 100)
 
     # Helper function to compute cumulative metrics with confidence intervals
     def compute_cumulative_metrics_with_ci(run_dirs, delta_key_str, z=1.96):
@@ -2068,6 +2581,8 @@ def __plot_cache_hit_vs_error_rate_vs_sample_size(
         )
 
     for target_delta, target_error_rate in zip(target_deltas, target_error_rates):
+        if target_delta not in vcache_local_data_frames:
+            continue
         ############################################################
         ### Baseline: vCache Local
         vcache_local_df = vcache_local_data_frames[target_delta]
@@ -2105,6 +2620,49 @@ def __plot_cache_hit_vs_error_rate_vs_sample_size(
             vcache_local_error_ci_ups = [0] * vcache_local_samples
             vcache_local_cache_hit_ci_lows = [0] * vcache_local_samples
             vcache_local_cache_hit_ci_ups = [0] * vcache_local_samples
+
+        ############################################################
+        ### Baseline: vCache Splitter
+        delta_key_str = f"{target_delta:.3f}".rstrip("0").rstrip(".")
+        if not delta_key_str and target_delta == 0:
+            delta_key_str = "0"
+
+        splitter_run_dirs = vcache_splitter_run_dirs_map.get(delta_key_str, [])
+        if vcache_splitter_data_frames and target_delta in vcache_splitter_data_frames:
+            df = vcache_splitter_data_frames[target_delta]
+            if len(splitter_run_dirs) > 1:
+                (
+                    vcache_splitter_error_rates,
+                    vcache_splitter_error_ci_lows,
+                    vcache_splitter_error_ci_ups,
+                    vcache_splitter_cache_hit_rates,
+                    vcache_splitter_cache_hit_ci_lows,
+                    vcache_splitter_cache_hit_ci_ups,
+                    vcache_splitter_samples,
+                ) = compute_cumulative_metrics_with_ci(splitter_run_dirs, delta_key_str)
+            else:
+                vcache_splitter_error_rates = [
+                    rate * 100
+                    for rate in compute_error_rate_cumulative_list(fp=df["fp_list"])
+                ]
+                vcache_splitter_cache_hit_rates = [
+                    rate * 100
+                    for rate in compute_cache_hit_rate_cumulative_list(
+                        cache_hit_list=df["cache_hit_list"]
+                    )
+                ]
+                vcache_splitter_samples = len(vcache_splitter_error_rates)
+                vcache_splitter_error_ci_lows = [0] * vcache_splitter_samples
+                vcache_splitter_error_ci_ups = [0] * vcache_splitter_samples
+                vcache_splitter_cache_hit_ci_lows = [0] * vcache_splitter_samples
+                vcache_splitter_cache_hit_ci_ups = [0] * vcache_splitter_samples
+        else:
+            vcache_splitter_error_rates = []
+            vcache_splitter_cache_hit_rates = []
+            vcache_splitter_error_ci_lows = []
+            vcache_splitter_error_ci_ups = []
+            vcache_splitter_cache_hit_ci_lows = []
+            vcache_splitter_cache_hit_ci_ups = []
 
         ############################################################
         ### Baseline: vCache Global
@@ -2359,6 +2917,25 @@ def __plot_cache_hit_vs_error_rate_vs_sample_size(
             "#37A9EC",
         )
 
+        # vCache Splitter
+        if vcache_splitter_data_frames and target_delta in vcache_splitter_data_frames:
+            plt.plot(
+                sample_sizes[::45],
+                vcache_splitter_error_rates[::45],
+                "-",
+                color="#9B59B6",
+                linewidth=2,
+                label=f"vCache Splitter (δ={target_delta})",
+                markersize=1,
+            )
+            add_confidence_band(
+                sample_sizes[::45],
+                vcache_splitter_error_rates[::45],
+                vcache_splitter_error_ci_lows[::45],
+                vcache_splitter_error_ci_ups[::45],
+                "#9B59B6",
+            )
+
         # vCache Global
         if vcache_global_data_frames and target_delta in vcache_global_data_frames:
             plt.plot(
@@ -2473,6 +3050,25 @@ def __plot_cache_hit_vs_error_rate_vs_sample_size(
             "#37A9EC",
         )
 
+        # vCache Splitter
+        if vcache_splitter_data_frames and target_delta in vcache_splitter_data_frames:
+            plt.plot(
+                sample_sizes[::5],
+                vcache_splitter_cache_hit_rates[::5],
+                "-",
+                color="#9B59B6",
+                linewidth=2,
+                label=f"vCache Splitter (δ={target_delta})",
+                markersize=1,
+            )
+            add_confidence_band(
+                sample_sizes[::5],
+                vcache_splitter_cache_hit_rates[::5],
+                vcache_splitter_cache_hit_ci_lows[::5],
+                vcache_splitter_cache_hit_ci_ups[::5],
+                "#9B59B6",
+            )
+
         # vCache Global
         if vcache_global_data_frames and target_delta in vcache_global_data_frames:
             plt.plot(
@@ -2569,12 +3165,14 @@ def __plot_cache_hit_vs_error_rate_vs_sample_size(
 
 def __plot_delta_accuracy(
     vcache_local_data_frames: Dict[float, pd.DataFrame],
+    vcache_splitter_data_frames: Dict[float, pd.DataFrame],
     vcache_global_data_frames: Dict[float, pd.DataFrame],
     vcache_berkeley_embedding_data_frames: Dict[float, pd.DataFrame],
     results_dir: str,
     timestamp: str,
     font_size: int,
     chopped_index: int,
+    vcache_splitter_run_dirs_map_override: Dict[str, List[str]] | None = None,
 ):
     plt.figure(figsize=(12, 8))
 
@@ -2582,77 +3180,133 @@ def __plot_delta_accuracy(
         results_dir, "vcache_local_"
     )
 
-    vcache_local_deltas_sorted = sorted(vcache_local_data_frames.keys())
+    if vcache_splitter_run_dirs_map_override is not None:
+        vcache_splitter_run_dirs_map = vcache_splitter_run_dirs_map_override
+    else:
+        vcache_splitter_run_dirs_map = __collect_run_dirs_by_prefix_and_key(
+            results_dir, "vcache_splitter_"
+        )
 
-    if vcache_local_deltas_sorted:
-        error_rate_means = []
-        error_rate_cis_lower_err = []  # error from mean to lower bound
-        error_rate_cis_upper_err = []  # error from mean to upper bound
+    all_deltas_sorted = sorted(
+        set(vcache_local_data_frames.keys()) | set(vcache_splitter_data_frames.keys())
+    )
+
+    if all_deltas_sorted:
+        local_error_rate_means = []
+        local_error_rate_cis_lower_err = []  # error from mean to lower bound
+        local_error_rate_cis_upper_err = []  # error from mean to upper bound
+        local_is_multi_run_list = []
+
+        splitter_error_rate_means = []
+        splitter_error_rate_cis_lower_err = []  # error from mean to lower bound
+        splitter_error_rate_cis_upper_err = []  # error from mean to upper bound
+        splitter_is_multi_run_list = []
+
         delta_labels = []
-        is_multi_run_list = []
 
-        for delta_val in vcache_local_deltas_sorted:
+        for delta_val in all_deltas_sorted:
             delta_key_str = f"{delta_val:.3f}".rstrip("0").rstrip(".")
             if not delta_key_str and delta_val == 0:
                 delta_key_str = "0"
 
-            current_run_dirs = vcache_local_run_dirs_map.get(delta_key_str, [])
-
-            if len(current_run_dirs) > 1:  # Multi-run
-                # We only need error rate stats from this function
-                er_mean, er_ci_low, er_ci_up, _, _, _ = (
-                    __aggregate_stats_for_latency_error(current_run_dirs)
+            local_run_dirs = vcache_local_run_dirs_map.get(delta_key_str, [])
+            if len(local_run_dirs) > 1:
+                er_mean, er_ci_low, er_ci_up, _, _, _ = __aggregate_stats_for_latency_error(
+                    local_run_dirs
                 )
-                error_rate_means.append(er_mean * 100)  # Convert to percentage scale
-                error_rate_cis_lower_err.append(max(0, (er_mean - er_ci_low) * 100))
-                error_rate_cis_upper_err.append(max(0, (er_ci_up - er_mean) * 100))
-                is_multi_run_list.append(True)
-            else:  # Single run
-                df = vcache_local_data_frames[delta_val]
-                er_mean_single = (
-                    compute_error_rate_score(fp=df["fp_list"]) * 100
-                )  # Convert to percentage scale
-                error_rate_means.append(er_mean_single)
-                error_rate_cis_lower_err.append(0)
-                error_rate_cis_upper_err.append(0)
-                is_multi_run_list.append(False)
+                local_error_rate_means.append(er_mean * 100)
+                local_error_rate_cis_lower_err.append(max(0, (er_mean - er_ci_low) * 100))
+                local_error_rate_cis_upper_err.append(max(0, (er_ci_up - er_mean) * 100))
+                local_is_multi_run_list.append(True)
+            else:
+                if delta_val in vcache_local_data_frames:
+                    df = vcache_local_data_frames[delta_val]
+                    er_mean_single = compute_error_rate_score(fp=df["fp_list"]) * 100
+                    local_error_rate_means.append(er_mean_single)
+                else:
+                    local_error_rate_means.append(0)
+                local_error_rate_cis_lower_err.append(0)
+                local_error_rate_cis_upper_err.append(0)
+                local_is_multi_run_list.append(False)
+
+            splitter_run_dirs = vcache_splitter_run_dirs_map.get(delta_key_str, [])
+            if len(splitter_run_dirs) > 1:
+                er_mean, er_ci_low, er_ci_up, _, _, _ = __aggregate_stats_for_latency_error(
+                    splitter_run_dirs
+                )
+                splitter_error_rate_means.append(er_mean * 100)
+                splitter_error_rate_cis_lower_err.append(max(0, (er_mean - er_ci_low) * 100))
+                splitter_error_rate_cis_upper_err.append(max(0, (er_ci_up - er_mean) * 100))
+                splitter_is_multi_run_list.append(True)
+            else:
+                if delta_val in vcache_splitter_data_frames:
+                    df = vcache_splitter_data_frames[delta_val]
+                    er_mean_single = compute_error_rate_score(fp=df["fp_list"]) * 100
+                    splitter_error_rate_means.append(er_mean_single)
+                else:
+                    splitter_error_rate_means.append(0)
+                splitter_error_rate_cis_lower_err.append(0)
+                splitter_error_rate_cis_upper_err.append(0)
+                splitter_is_multi_run_list.append(False)
 
             delta_labels.append(
                 f"{(delta_val * 100):.2f}"
             )  # Format to 2 decimal places
 
-        x_pos = np.arange(len(vcache_local_deltas_sorted))
-        bar_width = 0.8
+        x_pos = np.arange(len(all_deltas_sorted))
+        bar_width = 0.35
 
         # Prepare yerr for plt.bar. It needs to be a 2xN array for asymmetric error bars.
-        actual_errors_for_bar = [
-            list(z) for z in zip(error_rate_cis_lower_err, error_rate_cis_upper_err)
+        local_actual_errors_for_bar = [
+            list(z)
+            for z in zip(local_error_rate_cis_lower_err, local_error_rate_cis_upper_err)
         ]
-        # Only include error bars where is_multi_run is True, otherwise pass 0 for that bar
-        y_errors_for_plot = []
-        for i in range(len(is_multi_run_list)):
-            if is_multi_run_list[i]:
-                y_errors_for_plot.append(actual_errors_for_bar[i])
+        local_y_errors_for_plot = []
+        for i in range(len(local_is_multi_run_list)):
+            if local_is_multi_run_list[i]:
+                local_y_errors_for_plot.append(local_actual_errors_for_bar[i])
             else:
-                y_errors_for_plot.append([0, 0])  # No error bar for single runs
+                local_y_errors_for_plot.append([0, 0])
+        local_y_errors_for_plot_transposed = np.array(local_y_errors_for_plot).T
 
-        y_errors_for_plot_transposed = np.array(y_errors_for_plot).T
+        splitter_actual_errors_for_bar = [
+            list(z)
+            for z in zip(
+                splitter_error_rate_cis_lower_err, splitter_error_rate_cis_upper_err
+            )
+        ]
+        splitter_y_errors_for_plot = []
+        for i in range(len(splitter_is_multi_run_list)):
+            if splitter_is_multi_run_list[i]:
+                splitter_y_errors_for_plot.append(splitter_actual_errors_for_bar[i])
+            else:
+                splitter_y_errors_for_plot.append([0, 0])
+        splitter_y_errors_for_plot_transposed = np.array(splitter_y_errors_for_plot).T
 
         plt.bar(
-            x_pos,
-            error_rate_means,
+            x_pos - bar_width / 2,
+            local_error_rate_means,
             bar_width,
             color="#37A9EC",
-            label="Actual Error Rate",
-            yerr=y_errors_for_plot_transposed,
+            label="vCache Local Actual Error",
+            yerr=local_y_errors_for_plot_transposed,
+            capsize=10,
+        )
+        plt.bar(
+            x_pos + bar_width / 2,
+            splitter_error_rate_means,
+            bar_width,
+            color="#3B686A",
+            label="vCache Splitter Actual Error",
+            yerr=splitter_y_errors_for_plot_transposed,
             capsize=10,
         )
 
-        for i, delta_target_val in enumerate(vcache_local_deltas_sorted):
+        for i, delta_target_val in enumerate(all_deltas_sorted):
             plt.hlines(
                 y=delta_target_val * 100,  # Convert to percentage scale
-                xmin=i - bar_width / 2,
-                xmax=i + bar_width / 2,
+                xmin=i - 0.45,
+                xmax=i + 0.45,
                 colors="#EDBE24",
                 linestyles="dashed",
                 linewidth=3,
@@ -2661,10 +3315,11 @@ def __plot_delta_accuracy(
         custom_lines = [
             Line2D([0], [0], color="#EDBE24", linestyle="dashed", lw=4),
             Line2D([0], [0], color="#37A9EC", lw=4),
+            Line2D([0], [0], color="#3B686A", lw=4),
         ]
         plt.legend(
             custom_lines,
-            ["$\delta$ Target", "Actual Error"],
+            ["$\delta$ Target", "vCache Local Actual Error", "vCache Splitter Actual Error"],
             fontsize=font_size - 2,  # Adjusted for potentially more space needed
             handlelength=1.5,  # Adjusted handle length
             loc="upper left",  # Ensure legend doesn't overlap much
@@ -2685,14 +3340,19 @@ def __plot_delta_accuracy(
         plt.gca().spines["left"].set_linewidth(1)
 
         all_plot_values = (
-            error_rate_means
+            local_error_rate_means
             + [
                 er + ci_u
-                for er, ci_u in zip(error_rate_means, error_rate_cis_upper_err)
+                for er, ci_u in zip(local_error_rate_means, local_error_rate_cis_upper_err)
             ]
+            + splitter_error_rate_means
             + [
-                delta * 100 for delta in vcache_local_deltas_sorted
-            ]  # Convert to percentage scale
+                er + ci_u
+                for er, ci_u in zip(
+                    splitter_error_rate_means, splitter_error_rate_cis_upper_err
+                )
+            ]
+            + [delta * 100 for delta in all_deltas_sorted]
         )
         if all_plot_values:
             y_min = 0

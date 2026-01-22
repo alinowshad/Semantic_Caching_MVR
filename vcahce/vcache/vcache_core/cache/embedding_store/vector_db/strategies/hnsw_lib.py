@@ -1,6 +1,7 @@
 from typing import List
 
 import hnswlib
+import numpy as np
 
 from vcache.vcache_core.cache.embedding_store.vector_db.vector_db import (
     SimilarityMetricType,
@@ -93,7 +94,32 @@ class HNSWLibVectorDB(VectorDB):
         k_ = min(k, self.embedding_count)
         if k_ == 0:
             return []
-        ids, similarities = self.index.knn_query(embedding, k=k_)
+
+        query = np.asarray(embedding, dtype=np.float32)
+        if query.ndim == 1:
+            query = query.reshape(1, -1)
+
+        try:
+            if self.ef is not None:
+                self.index.set_ef(max(int(self.ef), int(k_)))
+            ids, similarities = self.index.knn_query(query, k=k_)
+        except Exception:
+            try:
+                self.index.set_ef(max(int(k_) * 4, int(self.ef or 0), 100))
+                ids, similarities = self.index.knn_query(query, k=k_)
+            except Exception:
+                found = False
+                for kk in range(int(k_) - 1, 0, -1):
+                    try:
+                        self.index.set_ef(max(int(kk) * 4, int(self.ef or 0), 100))
+                        ids, similarities = self.index.knn_query(query, k=kk)
+                        k_ = kk
+                        found = True
+                        break
+                    except Exception:
+                        continue
+                if not found:
+                    return []
         metric_type = self.similarity_metric_type.value
         similarity_scores = [
             self.transform_similarity_score(sim, metric_type) for sim in similarities[0]

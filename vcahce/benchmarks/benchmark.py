@@ -72,11 +72,20 @@ from vcache.inference_engine.strategies.benchmark import (
 )
 from vcache.inference_engine.strategies.silicon_flow import SiliconFlowInferenceEngine
 from vcache.main import VCache
+from vcache.vcache_core.cache.embedding_engine.embedding_engine import (
+    EmbeddingEngine,
+)
 from vcache.vcache_core.cache.embedding_engine.strategies.benchmark import (
     BenchmarkEmbeddingEngine,
 )
+from vcache.vcache_core.cache.embedding_engine.strategies.bge import (
+    BGEEmbeddingEngine,
+)
 from vcache.vcache_core.cache.embedding_engine.strategies.silicon_flow import (
     SiliconFlowEmbeddingEngine,
+)
+from vcache.vcache_core.splitter.embedding_model import (
+    EmbeddingModel as BGEEmbeddingModel,
 )
 from vcache.vcache_core.cache.embedding_store.embedding_metadata_storage import (
     InMemoryEmbeddingMetadataStorage,
@@ -118,7 +127,11 @@ from vcache.vcache_policy.strategies.benchmark_verified_global import (
 from vcache.vcache_policy.strategies.verified import (
     VerifiedDecisionPolicy,
 )
+from vcache.vcache_policy.strategies.verified_splitter import (
+    VerifiedSplitterDecisionPolicy,
+)
 from vcache.vcache_policy.vcache_policy import VCachePolicy
+from vcache.vcache_core.splitter.MaxSimSplitter import MaxSimSplitter
 
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 results_dir = os.path.join(repo_root, "benchmarks", "results")
@@ -129,6 +142,29 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s:%(message)s",
 )
+
+
+_CACHED_BGE_EMBEDDER_BY_DEVICE: Dict[str | None, BGEEmbeddingModel] = {}
+_CACHED_MAXSIM_SPLITTER_BY_DEVICE: Dict[Tuple[str, str], MaxSimSplitter] = {}
+
+
+class TimedEmbeddingEngine(EmbeddingEngine):
+    def __init__(self, inner_engine: EmbeddingEngine):
+        self._inner_engine = inner_engine
+        self._time_sum_s = 0.0
+
+    def reset_timing(self):
+        self._time_sum_s = 0.0
+
+    def get_timing(self) -> float:
+        return float(self._time_sum_s)
+
+    def get_embedding(self, text: str) -> List[float]:
+        t0 = time.time()
+        emb = self._inner_engine.get_embedding(text)
+        self._time_sum_s += time.time() - t0
+        return emb
+
 
 ########################################################################################################################
 ### Available Classes ##################################################################################################
@@ -198,11 +234,12 @@ class Baseline(Enum):
     GPTCache = "GPTCache"
     VCacheLocal = "vCacheLocal"
     VCacheGlobal = "vCacheGlobal"
+    VCacheSplitter = "vCacheSplitter"
     BerkeleyEmbedding = "BerkeleyEmbedding"
-    VCacheBerkeleyEmbedding = "VCacheBerkeleyEmbedding"
-    IID = "iid"
+    IID = "IID"
     SigmoidProbability = "SigmoidProbability"
     SigmoidOnly = "SigmoidOnly"
+    VCacheBerkeleyEmbedding = "VCacheBerkeleyEmbedding"
     NoCache = "NoCache"
 
 
@@ -223,6 +260,7 @@ class Dataset(Enum):
     SEM_BENCHMARK_COMBO = "vCache/SemBenchmarkCombo"
     # Example for custom dataset. The path is relative to 'benchmarks/your_datasets/'
     CUSTOM_EXAMPLE = "your_datasets/your_custom_dataset.parquet"
+    LOCAL_FILTERED_LMARENA = "datasets/filtered_sembenchmark_train.csv"
 
 
 class GeneratePlotsOnly(Enum):
@@ -258,82 +296,113 @@ RUN_COMBINATIONS: List[
     ]
 ] = [
     # vCache Paper: Figure 4 and 5 (top row)
-    (
-        EmbeddingModel.E5_LARGE_V2,
-        LargeLanguageModel.GPT_4O_MINI,
-        Dataset.SEM_BENCHMARK_ARENA,
-        GeneratePlotsOnly.NO,
-        BenchmarkComparisonSimilarityEvaluator(),
-        MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
-        60000,
-    ),
+    # (
+    #     EmbeddingModel.E5_LARGE_V2,
+    #     LargeLanguageModel.GPT_4O_MINI,
+    #     Dataset.SEM_BENCHMARK_ARENA,
+    #     GeneratePlotsOnly.NO,
+    #     BenchmarkComparisonSimilarityEvaluator(),
+    #     MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
+    #     60000,
+    # ),
     # vCache Paper: Figure 4 and 5 (bottom row)
-    (
-        EmbeddingModel.GTE,
-        LargeLanguageModel.LLAMA_3_8B,
-        Dataset.SEM_BENCHMARK_CLASSIFICATION,
-        GeneratePlotsOnly.NO,
-        StringComparisonSimilarityEvaluator(),
-        MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
-        45000,
-    ),
+    # (
+    #     EmbeddingModel.GTE,
+    #     LargeLanguageModel.LLAMA_3_8B,
+    #     Dataset.SEM_BENCHMARK_CLASSIFICATION,
+    #     GeneratePlotsOnly.NO,
+    #     StringComparisonSimilarityEvaluator(),
+    #     MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
+    #     45000,
+    # ),
     # vCache Paper: Figure 6 and 7
-    (
-        EmbeddingModel.GTE,
-        LargeLanguageModel.LLAMA_3_8B,
-        Dataset.SEM_BENCHMARK_SEARCH_QUERIES,
-        GeneratePlotsOnly.NO,
-        BenchmarkComparisonSimilarityEvaluator(),
-        MRUEvictionPolicy(max_size=160000, watermark=0.99, eviction_percentage=0.1),
-        150000,
-    ),
+    # (
+    #     EmbeddingModel.GTE,
+    #     LargeLanguageModel.LLAMA_3_8B,
+    #     Dataset.SEM_BENCHMARK_SEARCH_QUERIES,
+    #     GeneratePlotsOnly.NO,
+    #     BenchmarkComparisonSimilarityEvaluator(),
+    #     MRUEvictionPolicy(max_size=160000, watermark=0.99, eviction_percentage=0.1),
+    #     150000,
+    # ),
     # Custom Dataset
-    (
-        EmbeddingModel.OPENAI_TEXT_EMBEDDING_SMALL,
-        LargeLanguageModel.GPT_4_1,
-        Dataset.CUSTOM_EXAMPLE,
-        GeneratePlotsOnly.NO,
-        LLMComparisonSimilarityEvaluator(
-            inference_engine=SiliconFlowInferenceEngine(temperature=0.0)
-        ),
-        MRUEvictionPolicy(max_size=2000, watermark=0.99, eviction_percentage=0.1),
-        50,
-    ),
+    # (
+    #     EmbeddingModel.OPENAI_TEXT_EMBEDDING_SMALL,
+    #     LargeLanguageModel.GPT_4_1,
+    #     Dataset.CUSTOM_EXAMPLE,
+    #     GeneratePlotsOnly.NO,
+    #     LLMComparisonSimilarityEvaluator(
+    #         inference_engine=SiliconFlowInferenceEngine(temperature=0.0)
+    #     ),
+    #     MRUEvictionPolicy(max_size=2000, watermark=0.99, eviction_percentage=0.1),
+    #     50,
+    # ),
     # vCache Paper: Figure X (Third embedding model ablation)
-    (
-        EmbeddingModel.OPENAI_TEXT_EMBEDDING_SMALL,
-        LargeLanguageModel.GPT_4_1_NANO,
-        Dataset.SEM_BENCHMARK_ARENA,
+    # (
+    #     EmbeddingModel.OPENAI_TEXT_EMBEDDING_SMALL,
+    #     LargeLanguageModel.GPT_4_1_NANO,
+    #     Dataset.SEM_BENCHMARK_ARENA,
+    #     GeneratePlotsOnly.NO,
+    #     BenchmarkComparisonSimilarityEvaluator(),
+    #     MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
+    #     60000,
+    # ),
+    # vCache Paper: Figure X (SemBenchmarkCombo)
+    # (
+    #     EmbeddingModel.GTE,
+    #     LargeLanguageModel.LLAMA_3_8B,
+    #     Dataset.SEM_BENCHMARK_COMBO,
+    #     GeneratePlotsOnly.NO,
+    #     BenchmarkComparisonSimilarityEvaluator(),
+    #     MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
+    #     27500,
+    # ),
+    # (
+    #     EmbeddingModel.E5_LARGE_V2,
+    #     LargeLanguageModel.GPT_4O_MINI,
+    #     Dataset.LOCAL_FILTERED_LMARENA,
+    #     GeneratePlotsOnly.NO,
+    #     BenchmarkComparisonSimilarityEvaluator(),
+    #     MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
+    #     60000,
+    # ),
+       (
+        EmbeddingModel.E5_LARGE_V2,
+        LargeLanguageModel.LLAMA_3_8B,
+        Dataset.LOCAL_FILTERED_LMARENA,
         GeneratePlotsOnly.NO,
         BenchmarkComparisonSimilarityEvaluator(),
         MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
         60000,
     ),
-    # vCache Paper: Figure X (SemBenchmarkCombo)
-    (
-        EmbeddingModel.GTE,
-        LargeLanguageModel.LLAMA_3_8B,
-        Dataset.SEM_BENCHMARK_COMBO,
-        GeneratePlotsOnly.NO,
-        BenchmarkComparisonSimilarityEvaluator(),
-        MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
-        27500,
-    ),
+    
 ]
 
 BASELINES_TO_RUN: List[Baseline] = [
-    Baseline.VCacheLocal,
-    Baseline.IID,
-    Baseline.GPTCache,
-    Baseline.BerkeleyEmbedding,
-    Baseline.SigmoidProbability,
-    Baseline.SigmoidOnly,
-    Baseline.VCacheBerkeleyEmbedding,
+    # Baseline.VCacheLocal,
+    # Baseline.GPTCache,
+    Baseline.VCacheSplitter,
+    # Baseline.IID,
+    # Baseline.BerkeleyEmbedding,
+    # Baseline.SigmoidProbability,
+    # Baseline.SigmoidOnly,
+    # Baseline.VCacheBerkeleyEmbedding,
 ]
 
-STATIC_THRESHOLDS: List[float] = [0.80, 0.83, 0.86, 0.89, 0.92, 0.95, 0.97, 0.98, 0.99]
+STATIC_THRESHOLDS: List[float] = [0.80]
 
-DELTAS: List[float] = [0.01, 0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.05, 0.06, 0.07]
+DELTAS: List[float] = [0.02]
+
+SPLITTER_CHECKPOINT: str | None = os.environ.get("SPLITTER_CHECKPOINT","~/checkpoints_words/epoch=29-step=1620.ckpt")
+SPLITTER_DEVICE: str = os.environ.get("SPLITTER_DEVICE", "cuda")
+SPLITTER_CANDIDATE_SELECTION: str = os.environ.get("SPLITTER_CANDIDATE_SELECTION", "top_k")
+SPLITTER_CANDIDATE_K: int = int(os.environ.get("SPLITTER_CANDIDATE_K", "10"))
+SPLITTER_USE_CACHED_CANDIDATE_SEGMENTS: bool = (
+    os.environ.get("SPLITTER_USE_CACHED_CANDIDATE_SEGMENTS", "1").strip() in {"1", "true", "True"}
+)
+
+SPLITTER_CANDIDATE_SELECTIONS = ["top_k"]
+SPLITTER_CANDIDATE_KS = [7]
 
 
 ########################################################################################################################
@@ -377,6 +446,10 @@ class Benchmark(unittest.TestCase):
         self.is_static_threshold: bool = None
         self.eviction_policy: EvictionPolicy = None
         self.is_custom_dataset: bool = False
+        self._llm_response_col: str | None = None
+        self._llm_latency_col: str | None = None
+        self._emb_col: str | None = None
+        self._emb_latency_col: str | None = None
 
     def stats_set_up(self):
         """Initialize statistics tracking lists and create output directory.
@@ -406,6 +479,79 @@ class Benchmark(unittest.TestCase):
         if self.output_folder_path and not os.path.exists(self.output_folder_path):
             os.makedirs(self.output_folder_path)
 
+    def get_vcache_answer(
+        self,
+        *,
+        prompt: str,
+        candidate_embedding: List[float],
+        label_response: str,
+        system_prompt: str = "",
+        id_set: int = -1,
+    ):
+        embedding_engine = self.vcache.vcache_config.embedding_engine
+        if hasattr(embedding_engine, "set_next_embedding"):
+            if isinstance(candidate_embedding, str):
+                try:
+                    candidate_embedding = json.loads(candidate_embedding)
+                except Exception:
+                    import ast
+
+                    candidate_embedding = ast.literal_eval(candidate_embedding)
+
+            if isinstance(candidate_embedding, torch.Tensor):
+                candidate_embedding = candidate_embedding.tolist()
+            elif isinstance(candidate_embedding, np.ndarray):
+                candidate_embedding = candidate_embedding.tolist()
+
+            if isinstance(candidate_embedding, list):
+                candidate_embedding = [
+                    float(val) if hasattr(val, "__float__") else val
+                    for val in candidate_embedding
+                ]
+
+            embedding_engine.set_next_embedding(candidate_embedding)
+
+        inference_engine = self.vcache.vcache_config.inference_engine
+        if hasattr(inference_engine, "set_next_response"):
+            inference_engine.set_next_response(label_response)
+
+        t0 = time.time()
+        try:
+            is_cache_hit, response, response_metadata, nn_metadata = (
+                self.vcache.infer_with_cache_info(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    id_set=id_set,
+                )
+            )
+        except Exception as e:
+            logging.error("Error getting vCache answer. Check vCache logs for more details.")
+            raise e
+
+        total_s = time.time() - t0
+
+        emb_s = 0.0
+        if hasattr(embedding_engine, "get_timing"):
+            try:
+                emb_s = float(embedding_engine.get_timing())
+            except Exception:
+                emb_s = 0.0
+
+        latency_vcache_logic = max(0.0, float(total_s) - float(emb_s))
+        return is_cache_hit, response, response_metadata, nn_metadata, latency_vcache_logic
+
+    def get_vcache_answer_custom(self, *, prompt: str, system_prompt: str = "", id_set: int = -1):
+        t0 = time.time()
+        is_cache_hit, response, response_metadata, nn_metadata = (
+            self.vcache.infer_with_cache_info(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                id_set=id_set,
+            )
+        )
+        latency_vcache = time.time() - t0
+        return is_cache_hit, response, response_metadata, nn_metadata, float(latency_vcache)
+
     def run_benchmark_loop_custom(self, data_entries: List[Dict], max_samples: int):
         """Run benchmark loop for custom datasets with live inference.
 
@@ -429,6 +575,9 @@ class Benchmark(unittest.TestCase):
             desc="Processing entries",
             disable=DISABLE_PROGRESS_BAR,
         )
+
+        seen = 0
+        hits = 0
 
         for idx, data_entry in enumerate(data_entries):
             if idx >= max_samples:
@@ -467,6 +616,11 @@ class Benchmark(unittest.TestCase):
                 latency_vcache=latency_vcache,
             )
 
+            seen += 1
+            hits += int(is_cache_hit)
+            if (not DISABLE_PROGRESS_BAR) and (seen % 50 == 0 or seen == 1):
+                pbar.set_postfix(hits=hits, hit_rate=f"{(hits / max(seen, 1)) * 100:.2f}%")
+
             pbar.update(1)
 
         pbar.close()
@@ -496,7 +650,10 @@ class Benchmark(unittest.TestCase):
             desc="Processing entries",
             disable=DISABLE_PROGRESS_BAR,
         )
-        logging.info(f"data_entries: {data_entries}")
+        logging.info(f"Loaded {len(data_entries)} entries")
+
+        seen = 0
+        hits = 0
 
         for idx, data_entry in enumerate(data_entries):
             if idx >= max_samples:
@@ -506,20 +663,35 @@ class Benchmark(unittest.TestCase):
             prompt: str = data_entry["prompt"]
             system_prompt: str = data_entry.get("output_format", "")
 
-            emb_generation_latency: float = float(
-                data_entry[self.embedding_model[0] + "_lat"]
-            )
+            embedding_engine = self.vcache.vcache_config.embedding_engine
 
-            llm_generation_latency: float = float(
-                data_entry[self.llm_model[0] + "_lat"]
-            )
+            emb_key = self._emb_col or self.embedding_model[0]
+            emb_lat_key = self._emb_latency_col or (emb_key + "_lat")
+            llm_key = self._llm_response_col or self.llm_model[0]
+            llm_lat_key = self._llm_latency_col or (llm_key + "_lat")
+
+            if hasattr(embedding_engine, "set_next_embedding"):
+                emb_generation_latency_from_dataset: float = float(data_entry[emb_lat_key])
+            else:
+                emb_generation_latency_from_dataset = 0.0
+
+            llm_generation_latency: float = float(data_entry[llm_lat_key])
 
             # 2.1) Direct Inference (No Cache)
-            label_response: str = data_entry[self.llm_model[0]]
+            label_response: str = data_entry[llm_key]
             latency_direct: float = llm_generation_latency
 
             # 2.2) vCache Inference (With Cache)
-            candidate_embedding: List[float] = data_entry[self.embedding_model[0]]
+            candidate_embedding = data_entry.get(emb_key, None)
+            if candidate_embedding is None and hasattr(embedding_engine, "set_next_embedding"):
+                raise ValueError(
+                    f"Dataset is missing embedding column '{emb_key}' required for offline embedding injection."
+                )
+
+            if (not hasattr(embedding_engine, "set_next_embedding")) and hasattr(
+                embedding_engine, "reset_timing"
+            ):
+                embedding_engine.reset_timing()
 
             label_id_set: int = data_entry.get("id_set", -1)
             if label_id_set == -1:
@@ -533,12 +705,20 @@ class Benchmark(unittest.TestCase):
                 latency_vcache_logic,
             ) = self.get_vcache_answer(
                 prompt=prompt,
-                candidate_embedding=candidate_embedding,
+                candidate_embedding=candidate_embedding or [],
                 label_response=label_response,
                 system_prompt=system_prompt,
                 id_set=label_id_set,
             )
-            latency_vcache: float = latency_vcache_logic + emb_generation_latency
+
+            if hasattr(embedding_engine, "set_next_embedding"):
+                emb_generation_latency = emb_generation_latency_from_dataset
+            elif hasattr(embedding_engine, "get_timing"):
+                emb_generation_latency = float(embedding_engine.get_timing())
+            else:
+                emb_generation_latency = 0.0
+
+            latency_vcache: float = latency_vcache_logic + float(emb_generation_latency)
             if not is_cache_hit:
                 latency_vcache += llm_generation_latency
 
@@ -556,6 +736,11 @@ class Benchmark(unittest.TestCase):
                 latency_direct=latency_direct,
                 latency_vcache=latency_vcache,
             )
+
+            seen += 1
+            hits += int(is_cache_hit)
+            if (not DISABLE_PROGRESS_BAR) and (seen % 50 == 0 or seen == 1):
+                pbar.set_postfix(hits=hits, hit_rate=f"{(hits / max(seen, 1)) * 100:.2f}%")
 
             pbar.update(1)
 
@@ -590,15 +775,124 @@ class Benchmark(unittest.TestCase):
             if self.is_custom_dataset:
                 logging.info(f"Loading custom dataset: {self.filepath}")
                 if self.filepath.endswith(".csv"):
-                    df = pd.read_csv(self.filepath)
+                    try:
+                        df = pd.read_csv(self.filepath)
+                    except Exception as e:
+                        logging.warning(
+                            f"Default CSV parser failed ({type(e).__name__}: {e}). Retrying with python engine."
+                        )
+                        try:
+                            df = pd.read_csv(
+                                self.filepath,
+                                engine="python",
+                                on_bad_lines="skip",
+                                low_memory=False,
+                            )
+                        except TypeError:
+                            df = pd.read_csv(
+                                self.filepath,
+                                engine="python",
+                                error_bad_lines=False,
+                                warn_bad_lines=True,
+                                low_memory=False,
+                            )
                 elif self.filepath.endswith(".parquet"):
                     df = pd.read_parquet(self.filepath)
                 else:
                     raise ValueError(
                         f"Unsupported file format (not .csv or .parquet) for custom dataset: {self.filepath}"
                     )
+
+                if isinstance(
+                    self.vcache.vcache_config.similarity_evaluator,
+                    BenchmarkComparisonSimilarityEvaluator,
+                ):
+                    id_col = None
+                    if "ID_Set" in df.columns:
+                        id_col = "ID_Set"
+                    elif "id_set" in df.columns:
+                        id_col = "id_set"
+
+                    has_usable_ids = False
+                    if id_col is not None:
+                        try:
+                            s = pd.to_numeric(df[id_col], errors="coerce").fillna(-1)
+                            has_usable_ids = bool((s.astype(int) != -1).any())
+                        except Exception:
+                            has_usable_ids = False
+
+                    if not has_usable_ids:
+                        self.vcache.vcache_config.similarity_evaluator = (
+                            StringComparisonSimilarityEvaluator()
+                        )
+                        try:
+                            self.vcache.vcache_policy.similarity_evaluator = (
+                                self.vcache.vcache_config.similarity_evaluator
+                            )
+                        except Exception:
+                            pass
+                        logging.info(
+                            "Custom dataset has no usable ID_Set/id_set values; switched to StringComparisonSimilarityEvaluator (label equality after normalization)."
+                        )
+
                 data_iterator = df.to_dict("records")
-                self.run_benchmark_loop_custom(data_iterator, max_samples)
+
+                emb_col = self.embedding_model[0]
+                llm_col = self.llm_model[0]
+
+                def _pick_col(candidates: List[str]) -> str | None:
+                    for c in candidates:
+                        if c and c in df.columns:
+                            return c
+                    return None
+
+                llm_display = self.llm_model[1]
+                llm_resp_col = _pick_col([llm_col, llm_display, llm_display.lower()])
+                llm_lat_col = None
+                if llm_resp_col is not None:
+                    llm_lat_col = _pick_col([
+                        llm_resp_col + "_lat",
+                        llm_col + "_lat",
+                        llm_display + "_lat",
+                        llm_display.lower() + "_lat",
+                    ])
+
+                emb_lat_col = _pick_col([
+                    emb_col + "_lat",
+                    self.embedding_model[1] + "_lat",
+                    self.embedding_model[1].lower() + "_lat",
+                ])
+                emb_value_col = _pick_col([
+                    emb_col,
+                    self.embedding_model[1],
+                    self.embedding_model[1].lower(),
+                ])
+
+                if llm_resp_col is not None:
+                    if not hasattr(
+                        self.vcache.vcache_config.inference_engine, "set_next_response"
+                    ):
+                        self.vcache.vcache_config.inference_engine = BenchmarkInferenceEngine()
+                    if llm_lat_col is None:
+                        raise ValueError(
+                            "Custom dataset is missing required LLM latency column for offline benchmark. "
+                            f"Tried columns like '{llm_resp_col}_lat'"
+                        )
+
+                    # Persist resolved columns for use inside run_benchmark_loop
+                    self._llm_response_col = llm_resp_col
+                    self._llm_latency_col = llm_lat_col
+                    self._emb_col = emb_value_col
+                    self._emb_latency_col = emb_lat_col
+
+                    self.run_benchmark_loop(data_iterator, max_samples)
+                else:
+                    # No labeled responses in the CSV -> must run live LLM inference
+                    llm_model_name = self.llm_model[1].lower()
+                    self.vcache.vcache_config.inference_engine = SiliconFlowInferenceEngine(
+                        model_name=llm_model_name
+                    )
+                    self.run_benchmark_loop_custom(data_iterator, max_samples)
             elif "/" in self.filepath:
                 logging.info(f"Loading Hugging Face dataset: {self.filepath}")
                 # Optional HF auth token to avoid rate limits (works with HF mirror too).
@@ -626,11 +920,9 @@ class Benchmark(unittest.TestCase):
             parameter=self.threshold if self.is_static_threshold else self.delta,
         )
 
-    ########################################################################################################################
-    ### Class Helper Functions #############################################################################################
-    ########################################################################################################################
     def update_stats(
         self,
+        *,
         is_cache_hit: bool,
         label_response: str,
         cache_response: str,
@@ -640,41 +932,16 @@ class Benchmark(unittest.TestCase):
         latency_direct: float,
         latency_vcache: float,
     ):
-        """Update benchmark statistics with results from a single inference.
-
-        This method processes the results of a single inference request and updates
-        the appropriate statistics tracking lists. It handles both cache hits and
-        misses, calculating true/false positives/negatives based on response
-        correctness.
-
-        Args:
-            is_cache_hit: Whether the request resulted in a cache hit.
-            label_response: The ground truth response for the prompt.
-            cache_response: The response returned from the cache (if cache hit).
-            label_id_set: The ground truth ID set for the prompt (-1 if not available).
-            response_metadata: Metadata object for the cache response.
-            nn_metadata: Metadata object for the nearest neighbor in cache.
-            latency_direct: Latency for direct inference without cache.
-            latency_vcache: Latency for vCache inference including cache logic.
-
-        Note:
-            The method uses different correctness evaluation strategies based on
-            whether ID sets are available or if it's a custom dataset requiring
-            LLM-based evaluation.
-        """
-        if is_cache_hit:  # If cache hit, the actual response is the nearest neighbor response (cache_response == nn_response)
+        if is_cache_hit:
             self.cache_hit_list.append(1)
             self.cache_miss_list.append(0)
 
-            equality_check_with_id_set: bool = label_id_set != -1
-            if equality_check_with_id_set:
-                cache_response_correct: bool = label_id_set == response_metadata.id_set
-            elif self.is_custom_dataset:
-                cache_response_correct: bool = answers_have_same_meaning_llm(
-                    label_response, cache_response
+            if label_id_set != -1:
+                cache_response_correct = (
+                    int(label_id_set) == int(getattr(response_metadata, "id_set", -999999))
                 )
             else:
-                cache_response_correct: bool = answers_have_same_meaning_static(
+                cache_response_correct = answers_have_same_meaning_static(
                     label_response, cache_response
                 )
 
@@ -682,205 +949,60 @@ class Benchmark(unittest.TestCase):
                 self.tp_list.append(1)
                 self.fp_list.append(0)
             else:
-                self.fp_list.append(1)
                 self.tp_list.append(0)
-            self.fn_list.append(0)
-            self.tn_list.append(0)
-        else:  # If cache miss, the actual response is the label response
-            self.cache_miss_list.append(1)
-            self.cache_hit_list.append(0)
+                self.fp_list.append(1)
 
-            equality_check_with_id_set: bool = label_id_set != -1
-            if equality_check_with_id_set:
-                nn_response_correct: bool = label_id_set == nn_metadata.id_set
-            elif self.is_custom_dataset:
-                nn_response_correct: bool = answers_have_same_meaning_llm(
-                    label_response, nn_metadata.response
+            self.tn_list.append(0)
+            self.fn_list.append(0)
+        else:
+            self.cache_hit_list.append(0)
+            self.cache_miss_list.append(1)
+
+            if label_id_set != -1:
+                nn_response_correct = (
+                    int(label_id_set) == int(getattr(nn_metadata, "id_set", -999999))
                 )
             else:
-                nn_response_correct: bool = answers_have_same_meaning_static(
-                    label_response, nn_metadata.response
+                nn_response_correct = answers_have_same_meaning_static(
+                    label_response, getattr(nn_metadata, "response", "")
                 )
 
+            self.tp_list.append(0)
+            self.fp_list.append(0)
             if nn_response_correct:
-                self.fn_list.append(1)
                 self.tn_list.append(0)
+                self.fn_list.append(1)
             else:
                 self.tn_list.append(1)
                 self.fn_list.append(0)
-            self.tp_list.append(0)
-            self.fp_list.append(0)
 
-        self.latency_direct_list.append(latency_direct)
-        self.latency_vcache_list.append(latency_vcache)
-
-    def get_vcache_answer(
-        self,
-        prompt: str,
-        candidate_embedding: List[float],
-        label_response: str,
-        system_prompt: str,
-        id_set: int,
-    ) -> Tuple[bool, str, EmbeddingMetadataObj, EmbeddingMetadataObj, float]:
-        """Get vCache response for pre-computed datasets with embedding injection.
-
-        This method simulates vCache inference by injecting pre-computed embeddings
-        and responses into the vCache engines, then measuring the cache decision
-        and response retrieval performance.
-
-        Args:
-            prompt: The input prompt for inference.
-            candidate_embedding: Pre-computed embedding vector for the prompt.
-            label_response: Ground truth response to inject into inference engine.
-            system_prompt: System prompt for structured outputs.
-            id_set: ID set for the prompt (used for correctness evaluation).
-
-        Returns:
-            Tuple containing:
-            - is_cache_hit: Whether the request resulted in a cache hit
-            - cache_response: The response returned by vCache
-            - response_metadata: Metadata for the cache response
-            - nn_metadata: Metadata for the nearest neighbor
-            - latency_vcache_logic: Time spent in vCache logic (excluding model calls)
-
-        Note:
-            This method handles various embedding formats (string, tensor, numpy array)
-            and converts them to the appropriate list format for vCache processing.
-        """
-        if isinstance(candidate_embedding, str):
-            try:
-                candidate_embedding = json.loads(candidate_embedding)
-            except json.JSONDecodeError:
-                print("Error loading embedding from string")
-                import ast
-
-                candidate_embedding = ast.literal_eval(candidate_embedding)
-
-        if isinstance(candidate_embedding, torch.Tensor):
-            candidate_embedding = candidate_embedding.tolist()
-        elif isinstance(candidate_embedding, np.ndarray):
-            candidate_embedding = candidate_embedding.tolist()
-
-        if isinstance(candidate_embedding, list):
-            candidate_embedding = [
-                float(val) if hasattr(val, "__float__") else val
-                for val in candidate_embedding
-            ]
-
-        self.vcache.vcache_config.embedding_engine.set_next_embedding(
-            candidate_embedding
-        )
-        self.vcache.vcache_config.inference_engine.set_next_response(label_response)
-
-        latency_vcache_logic: float = time.time()
-        try:
-            is_cache_hit, cache_response, response_metadata, nn_metadata = (
-                self.vcache.infer_with_cache_info(
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    id_set=id_set,
-                )
-            )
-        except Exception as e:
-            logging.error(
-                "Error getting vCache answer. Check vCache logs for more details."
-            )
-            raise e
-
-        latency_vcache_logic = time.time() - latency_vcache_logic
-        return (
-            is_cache_hit,
-            cache_response,
-            response_metadata,
-            nn_metadata,
-            latency_vcache_logic,
-        )
-
-    def get_vcache_answer_custom(
-        self, prompt: str
-    ) -> Tuple[bool, str, EmbeddingMetadataObj, EmbeddingMetadataObj, float]:
-        """Get vCache response for custom datasets with live inference.
-
-        This method performs live vCache inference for custom datasets, making
-        actual calls to embedding and inference engines without pre-computed
-        values.
-
-        Args:
-            prompt: The input prompt for inference.
-
-        Returns:
-            Tuple containing:
-            - is_cache_hit: Whether the request resulted in a cache hit
-            - cache_response: The response returned by vCache
-            - response_metadata: Metadata for the cache response
-            - nn_metadata: Metadata for the nearest neighbor
-            - latency_vcache_logic: Time spent in vCache logic (excluding model calls)
-
-        Note:
-            This method makes live API calls and may incur costs and latency
-            depending on the configured engines.
-        """
-        latency_vcache_logic: float = time.time()
-        try:
-            (
-                is_cache_hit,
-                cache_response,
-                response_metadata,
-                nn_metadata,
-            ) = self.vcache.infer_with_cache_info(prompt=prompt)
-        except Exception as e:
-            logging.error(
-                "Error getting vCache answer. Check vCache logs for more details."
-            )
-            raise e
-
-        latency_vcache_logic = time.time() - latency_vcache_logic
-
-        return (
-            is_cache_hit,
-            cache_response,
-            response_metadata,
-            nn_metadata,
-            latency_vcache_logic,
-        )
+        self.latency_direct_list.append(float(latency_direct))
+        self.latency_vcache_list.append(float(latency_vcache))
 
     def dump_results_to_json(self):
-        """Serialize benchmark results to JSON file.
+        observations_dict: Dict[str, Dict[str, float]] = {}
+        gammas_dict: Dict[str, float] = {}
+        t_hats_dict: Dict[str, float] = {}
+        t_primes_dict: Dict[str, float] = {}
+        var_ts_dict: Dict[str, float] = {}
 
-        This method collects all benchmark statistics, configuration parameters,
-        and internal vCache state (observations, Bayesian parameters) and saves
-        them to a JSON file for later analysis and plotting.
-
-        The output includes:
-        - Configuration parameters (models, thresholds, policies)
-        - Performance metrics (cache hits, accuracy, latency)
-        - Internal vCache statistics (observations, policy parameters)
-        - Global statistics (if available from the policy)
-
-        The JSON file is saved in the output folder with a timestamp-based filename.
-
-        Raises:
-            Exception: If there are issues accessing vCache internal state or
-                writing to the output file.
-        """
-        observations_dict = {}
-        gammas_dict = {}
-        t_hats_dict = {}
-        t_primes_dict = {}
-        var_ts_dict = {}
-
-        metadata_objects: List[EmbeddingMetadataObj] = (
-            self.vcache.vcache_config.embedding_metadata_storage.get_all_embedding_metadata_objects()
-        )
+        try:
+            metadata_objects: List[EmbeddingMetadataObj] = (
+                self.vcache.vcache_config.embedding_metadata_storage.get_all_embedding_metadata_objects()
+            )
+        except Exception:
+            metadata_objects = []
 
         for metadata_object in metadata_objects:
-            observations_dict[metadata_object.embedding_id] = (
-                metadata_object.observations
-            )
-            gammas_dict[metadata_object.embedding_id] = metadata_object.gamma
-            t_hats_dict[metadata_object.embedding_id] = metadata_object.t_hat
-            t_primes_dict[metadata_object.embedding_id] = metadata_object.t_prime
-            var_ts_dict[metadata_object.embedding_id] = metadata_object.var_t
+            try:
+                embedding_id = str(metadata_object.embedding_id)
+            except Exception:
+                continue
+            observations_dict[embedding_id] = getattr(metadata_object, "observations", {})
+            gammas_dict[embedding_id] = getattr(metadata_object, "gamma", None)
+            t_hats_dict[embedding_id] = getattr(metadata_object, "t_hat", None)
+            t_primes_dict[embedding_id] = getattr(metadata_object, "t_prime", None)
+            var_ts_dict[embedding_id] = getattr(metadata_object, "var_t", None)
 
         self.observations_dict = observations_dict
         self.gammas_dict = gammas_dict
@@ -931,6 +1053,21 @@ class Benchmark(unittest.TestCase):
             "global_var_t": global_var_t,
         }
 
+        try:
+            policy = getattr(self.vcache, "vcache_policy", None)
+            if isinstance(policy, VerifiedSplitterDecisionPolicy):
+                data["config"]["splitter_candidate_selection"] = getattr(
+                    policy, "candidate_selection", None
+                )
+                data["config"]["splitter_candidate_k"] = getattr(policy, "candidate_k", None)
+                data["config"]["splitter_use_cached_candidate_segments"] = getattr(
+                    policy, "use_cached_candidate_segments", None
+                )
+                data["config"]["splitter_device"] = getattr(policy, "device", None)
+                data["config"]["splitter_checkpoint"] = SPLITTER_CHECKPOINT
+        except Exception:
+            pass
+
         filepath = self.output_folder_path + f"/results_{self.timestamp}.json"
         with open(filepath, "w") as json_file:
             json.dump(data, json_file, indent=4)
@@ -955,39 +1092,32 @@ def __run_baseline(
     eviction_policy: EvictionPolicy,
     max_samples: int,
     is_custom_dataset: bool = False,
+    splitter_device: str | None = None,
+    splitter_candidate_selection: str | None = None,
+    splitter_candidate_k: int | None = None,
+    splitter_use_cached_candidate_segments: bool | None = None,
 ):
-    """Run a single baseline benchmark configuration.
-
-    This helper function creates a vCache instance with the specified configuration
-    and runs a complete benchmark evaluation. It handles both custom datasets
-    (requiring live inference) and pre-computed datasets.
-
-    Args:
-        vcache_policy: The caching policy to evaluate (e.g., VerifiedDecisionPolicy).
-        path: Output directory path for saving results.
-        dataset_file: Path to the dataset file or HuggingFace dataset ID.
-        embedding_model: Tuple containing embedding model configuration.
-        llm_model: Tuple containing LLM model configuration.
-        timestamp: Timestamp string for result file naming.
-        delta: Delta parameter for dynamic policies (-1 if not applicable).
-        threshold: Threshold parameter for static policies (-1 if not applicable).
-        similarity_evaluator: Strategy for evaluating response similarity.
-        eviction_policy: Cache eviction policy instance.
-        max_samples: Maximum number of samples to process.
-        is_custom_dataset: Whether using custom dataset format requiring live inference.
-
-    Note:
-        This function creates different vCache configurations based on whether
-        it's processing custom datasets (using OpenAI engines) or pre-computed
-        datasets (using benchmark engines).
-    """
     if is_custom_dataset:
         llm_model_name = llm_model[1].lower()
         embedding_model_name = embedding_model[1].lower()
 
+        bge_device = os.environ.get("BGE_DEVICE")
+        bge_device_key = bge_device if bge_device and bge_device.strip() else None
+        bge_embedder = _CACHED_BGE_EMBEDDER_BY_DEVICE.get(bge_device_key)
+        if bge_embedder is None:
+            bge_embedder = (
+                BGEEmbeddingModel(device=bge_device)
+                if bge_device is not None and bge_device != ""
+                else BGEEmbeddingModel()
+            )
+            _CACHED_BGE_EMBEDDER_BY_DEVICE[bge_device_key] = bge_embedder
+
         vcache_config: VCacheConfig = VCacheConfig(
-            inference_engine=SiliconFlowInferenceEngine(model_name=llm_model_name),
-            embedding_engine=SiliconFlowEmbeddingEngine(model_name=embedding_model_name),
+            inference_engine=BenchmarkInferenceEngine(),
+            # embedding_engine=SiliconFlowEmbeddingEngine(model_name=embedding_model_name),
+            embedding_engine=TimedEmbeddingEngine(
+                BGEEmbeddingEngine(embedding_model=bge_embedder)
+            ),
             vector_db=HNSWLibVectorDB(
                 similarity_metric_type=SimilarityMetricType.COSINE,
                 max_capacity=MAX_VECTOR_DB_CAPACITY,
@@ -997,9 +1127,21 @@ def __run_baseline(
             eviction_policy=eviction_policy,
         )
     else:
+        bge_device = os.environ.get("BGE_DEVICE")
+        bge_device_key = bge_device if bge_device and bge_device.strip() else None
+        bge_embedder = _CACHED_BGE_EMBEDDER_BY_DEVICE.get(bge_device_key)
+        if bge_embedder is None:
+            bge_embedder = (
+                BGEEmbeddingModel(device=bge_device)
+                if bge_device is not None and bge_device != ""
+                else BGEEmbeddingModel()
+            )
+            _CACHED_BGE_EMBEDDER_BY_DEVICE[bge_device_key] = bge_embedder
         vcache_config: VCacheConfig = VCacheConfig(
             inference_engine=BenchmarkInferenceEngine(),
-            embedding_engine=BenchmarkEmbeddingEngine(),
+            embedding_engine=TimedEmbeddingEngine(
+                BGEEmbeddingEngine(embedding_model=bge_embedder)
+            ),
             vector_db=HNSWLibVectorDB(
                 similarity_metric_type=SimilarityMetricType.COSINE,
                 max_capacity=MAX_VECTOR_DB_CAPACITY,
@@ -1008,6 +1150,49 @@ def __run_baseline(
             similarity_evaluator=similarity_evaluator,
             eviction_policy=eviction_policy,
         )
+
+    # Attach RL MaxSim splitter for the VerifiedSplitterDecisionPolicy baseline.
+    if isinstance(vcache_policy, VerifiedSplitterDecisionPolicy):
+        resolved_splitter_device = splitter_device or SPLITTER_DEVICE
+        resolved_candidate_selection = (
+            splitter_candidate_selection
+            if splitter_candidate_selection is not None
+            else SPLITTER_CANDIDATE_SELECTION
+        )
+        resolved_candidate_k = (
+            int(splitter_candidate_k)
+            if splitter_candidate_k is not None
+            else int(SPLITTER_CANDIDATE_K)
+        )
+        resolved_use_cached_segments = (
+            bool(splitter_use_cached_candidate_segments)
+            if splitter_use_cached_candidate_segments is not None
+            else bool(SPLITTER_USE_CACHED_CANDIDATE_SEGMENTS)
+        )
+
+        if getattr(vcache_policy, "splitter", None) is None:
+            if not SPLITTER_CHECKPOINT:
+                raise ValueError(
+                    "SPLITTER_CHECKPOINT is required for VCacheSplitter baseline. "
+                    "Set env var SPLITTER_CHECKPOINT=... (checkpoint file or dir)."
+                )
+
+            splitter_cache_key = (str(SPLITTER_CHECKPOINT), str(resolved_splitter_device))
+            cached_splitter = _CACHED_MAXSIM_SPLITTER_BY_DEVICE.get(splitter_cache_key)
+            if cached_splitter is None:
+                cached_splitter = MaxSimSplitter(
+                    checkpoint_path=SPLITTER_CHECKPOINT,
+                    device=resolved_splitter_device,
+                    embedding_model=bge_embedder,
+                )
+                _CACHED_MAXSIM_SPLITTER_BY_DEVICE[splitter_cache_key] = cached_splitter
+            vcache_policy.splitter = cached_splitter
+
+        # Ensure policy settings are synced to the global benchmark config.
+        vcache_policy.device = resolved_splitter_device
+        vcache_policy.candidate_selection = resolved_candidate_selection
+        vcache_policy.candidate_k = int(resolved_candidate_k)
+        vcache_policy.use_cached_candidate_segments = bool(resolved_use_cached_segments)
 
     vcache: VCache = VCache(vcache_config, vcache_policy)
 
@@ -1079,11 +1264,23 @@ def main():
     ) in RUN_COMBINATIONS:
         try:
             dataset_value: str = dataset.value
-            is_custom_dataset: bool = dataset_value.startswith("your_datasets")
+            is_custom_dataset: bool = (
+                dataset_value.startswith("your_datasets")
+                or dataset_value.endswith(".csv")
+                or dataset_value.endswith(".parquet")
+                or os.path.isabs(dataset_value)
+                or os.path.exists(dataset_value)
+            )
 
             if is_custom_dataset:
-                # The path in the enum is relative to 'benchmarks/data/'
-                dataset_path = os.path.join(benchmarks_dir, dataset_value)
+                # For custom datasets we support either:
+                # - a relative path under benchmarks/ (e.g. "your_datasets/foo.csv")
+                # - an absolute path (e.g. "/data1/.../foo.csv")
+                dataset_path = (
+                    dataset_value
+                    if os.path.isabs(dataset_value) or os.path.exists(dataset_value)
+                    else os.path.join(benchmarks_dir, dataset_value)
+                )
                 dataset_name = os.path.basename(dataset_path)
                 if not os.path.exists(dataset_path):
                     logging.warning(f"Custom dataset file not found: {dataset_path}")
@@ -1140,6 +1337,66 @@ def main():
                             max_samples=max_samples,
                             is_custom_dataset=is_custom_dataset,
                         )
+
+            #####################################################
+            ### Baseline: vCache Splitter (RL MaxSim)
+            if (
+                Baseline.VCacheSplitter in BASELINES_TO_RUN
+                and not generate_plots_only.value
+            ):
+                for delta in DELTAS:
+                    for candidate_selection in SPLITTER_CANDIDATE_SELECTIONS:
+                        candidate_ks = (
+                            [-1]
+                            if candidate_selection == "all"
+                            else SPLITTER_CANDIDATE_KS
+                        )
+                        for candidate_k in candidate_ks:
+                            candidate_k_label = "all" if candidate_k == -1 else str(int(candidate_k))
+                            for i in range(0, CONFIDENCE_INTERVALS_ITERATIONS):
+                                path = os.path.join(
+                                    results_dir,
+                                    dataset_name,
+                                    embedding_model.value[1],
+                                    llm_model.value[1],
+                                    f"vcache_splitter_{delta}_{candidate_selection}_{candidate_k_label}_run_{i + 1}",
+                                )
+                                if os.path.exists(path) and os.listdir(path):
+                                    continue
+
+                                logging.info(
+                                    f"vCache Splitter: delta={delta} candidate_selection={candidate_selection} candidate_k={candidate_k_label}. Run {i + 1} of {CONFIDENCE_INTERVALS_ITERATIONS}"
+                                )
+
+                                __run_baseline(
+                                    vcache_policy=VerifiedSplitterDecisionPolicy(
+                                        delta=delta,
+                                        splitter=None,
+                                        device=SPLITTER_DEVICE,
+                                        candidate_selection=candidate_selection,
+                                        candidate_k=(1 if candidate_k == -1 else int(candidate_k)),
+                                        use_cached_candidate_segments=bool(
+                                            SPLITTER_USE_CACHED_CANDIDATE_SEGMENTS
+                                        ),
+                                    ),
+                                    path=path,
+                                    dataset_file=dataset_path,
+                                    embedding_model=embedding_model.value,
+                                    llm_model=llm_model.value,
+                                    timestamp=timestamp,
+                                    delta=delta,
+                                    threshold=-1,
+                                    similarity_evaluator=similarity_evaluator,
+                                    eviction_policy=eviction_policy,
+                                    max_samples=max_samples,
+                                    is_custom_dataset=is_custom_dataset,
+                                    splitter_device=SPLITTER_DEVICE,
+                                    splitter_candidate_selection=candidate_selection,
+                                    splitter_candidate_k=(None if candidate_k == -1 else int(candidate_k)),
+                                    splitter_use_cached_candidate_segments=bool(
+                                        SPLITTER_USE_CACHED_CANDIDATE_SEGMENTS
+                                    ),
+                                )
 
             #####################################################
             ### Baseline: vCache Global

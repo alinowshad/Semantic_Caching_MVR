@@ -49,12 +49,22 @@ $env:SPLITTER_DEBUG_EVERY_N="1"
 export SPLITTER_SPLIT_WORDS_BEFORE=1
 """
 
+import warnings
+
+# Silence sklearn 1.8+ deprecation warning spam coming from LogisticRegression(penalty=...).
+warnings.filterwarnings(
+    "ignore",
+    message=".*'penalty' was deprecated.*",
+    category=FutureWarning,
+)
+
 import json
 import logging
 import os
 import re
 import time
 import unittest
+import sys
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Tuple
@@ -71,6 +81,20 @@ from benchmarks.common.comparison import (
     answers_have_same_meaning_llm,
     answers_have_same_meaning_static,
 )
+
+# --------------------------------------------------------------------------------------
+# IMPORTANT: ensure we import the *local repo* `vcache/` package, not an installed copy.
+#
+# When running this file directly (`python /abs/path/to/benchmark4LM.py`), Python adds
+# `.../vcahce/benchmarks` to sys.path (NOT `.../vcahce`). Without this, `import vcache`
+# can resolve to some other installation (e.g. `/home/ali/vcahce/vcache`) and you'll
+# silently run different code than what's in this repo.
+# --------------------------------------------------------------------------------------
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))  # .../vcahce
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from vcache.config import VCacheConfig
 from vcache.inference_engine.strategies.benchmark import (
     BenchmarkInferenceEngine,
@@ -104,6 +128,9 @@ from vcache.vcache_core.cache.embedding_store.vector_db import (
 )
 from vcache.vcache_core.cache.eviction_policy.eviction_policy import EvictionPolicy
 from vcache.vcache_core.cache.eviction_policy.strategies.mru import MRUEvictionPolicy
+from vcache.vcache_core.cache.eviction_policy.strategies.no_eviction import (
+    NoEvictionPolicy,
+)
 from vcache.vcache_core.similarity_evaluator import SimilarityEvaluator
 from vcache.vcache_core.similarity_evaluator.strategies.benchmark_comparison import (
     BenchmarkComparisonSimilarityEvaluator,
@@ -272,7 +299,7 @@ class Dataset(Enum):
     SEM_BENCHMARK_COMBO = "vCache/SemBenchmarkCombo"
     # Example for custom dataset. The path is relative to 'benchmarks/your_datasets/'
     CUSTOM_EXAMPLE = "your_datasets/your_custom_dataset.parquet"
-    LOCAL_FILTERED_LMARENA = "/data1/wuyinjun/semantic_cache_dataset/dataset/filtered_SemBenchmarkLmArena_train.csv"
+    LOCAL_FILTERED_LMARENA = "/root/LMArena/train_3k.parquet"
 
 
 class GeneratePlotsOnly(Enum):
@@ -295,6 +322,14 @@ DISABLE_PROGRESS_BAR: bool = False
 KEEP_SPLIT: int = 100
 MAX_VECTOR_DB_CAPACITY: int = 150000
 PLOT_FONT_SIZE: int = 50
+
+# -------------------------------------------------------------------------------------------------
+# Local defaults (can be overridden by env vars)
+# These make it easy to run the splitter benchmark without exporting env vars each time.
+# -------------------------------------------------------------------------------------------------
+DEFAULT_SPLITTER_CHECKPOINT: str = "/root/data/checkpoints"
+DEFAULT_SPLITTER_DEVICE: str = "cuda:1"
+DEFAULT_BGE_DEVICE: str = "cuda:1"
 
 RUN_COMBINATIONS: List[
     Tuple[
@@ -375,7 +410,7 @@ RUN_COMBINATIONS: List[
         Dataset.LOCAL_FILTERED_LMARENA,
         GeneratePlotsOnly.NO,
         BenchmarkComparisonSimilarityEvaluator(),
-        MRUEvictionPolicy(max_size=100000, watermark=0.99, eviction_percentage=0.1),
+        NoEvictionPolicy(),
         60000,
     ),
     #    (
@@ -403,10 +438,13 @@ BASELINES_TO_RUN: List[Baseline] = [
 
 STATIC_THRESHOLDS: List[float] = [0.80]
 
-DELTAS: List[float] = [0.01, 0.015, 0.02, 0.03, 0.05, 0.07, 0.08]
+DELTAS: List[float] = [0.01]
 
-SPLITTER_CHECKPOINT: str | None = os.environ.get("SPLITTER_CHECKPOINT","~/checkpoints_words_bef/epoch=14-step=810.ckpt")
-SPLITTER_DEVICE: str = os.environ.get("SPLITTER_DEVICE", "cuda")
+# Splitter config
+# - SPLITTER_CHECKPOINT can be a checkpoint *file* or a directory (MaxSimSplitter will auto-pick latest ckpt).
+# - SPLITTER_DEVICE can be "cpu", "cuda", or "cuda:<id>".
+SPLITTER_CHECKPOINT: str | None = os.environ.get("SPLITTER_CHECKPOINT", DEFAULT_SPLITTER_CHECKPOINT)
+SPLITTER_DEVICE: str = os.environ.get("SPLITTER_DEVICE", DEFAULT_SPLITTER_DEVICE)
 SPLITTER_CANDIDATE_SELECTION: str = os.environ.get("SPLITTER_CANDIDATE_SELECTION", "top_k")
 SPLITTER_CANDIDATE_K: int = int(os.environ.get("SPLITTER_CANDIDATE_K", "10"))
 SPLITTER_USE_CACHED_CANDIDATE_SEGMENTS: bool = (
@@ -633,7 +671,16 @@ class Benchmark(unittest.TestCase):
             if (not DISABLE_PROGRESS_BAR) and (seen % 50 == 0 or seen == 1):
                 pbar.set_postfix(hits=hits, hit_rate=f"{(hits / max(seen, 1)) * 100:.2f}%")
 
-            pbar.update(1)
+            # tqdm can raise BrokenPipeError if stdout/stderr is closed (e.g., detached SSH,
+            # piping output to `head`, or a log collector closing the stream). We do NOT
+            # want the benchmark to abort because of progress bar output.
+            try:
+                pbar.update(1)
+            except BrokenPipeError:
+                try:
+                    pbar.disable = True
+                except Exception:
+                    pass
 
         pbar.close()
 
@@ -754,7 +801,14 @@ class Benchmark(unittest.TestCase):
             if (not DISABLE_PROGRESS_BAR) and (seen % 50 == 0 or seen == 1):
                 pbar.set_postfix(hits=hits, hit_rate=f"{(hits / max(seen, 1)) * 100:.2f}%")
 
-            pbar.update(1)
+            # Same BrokenPipe guard as above; keep running even if tqdm cannot write.
+            try:
+                pbar.update(1)
+            except BrokenPipeError:
+                try:
+                    pbar.disable = True
+                except Exception:
+                    pass
 
         pbar.close()
 
@@ -921,7 +975,17 @@ class Benchmark(unittest.TestCase):
             logging.error(f"Benchmark dataset file not found: {e}")
             return
         except Exception as e:
-            logging.error(f"Error processing benchmark: {e}")
+            # Always log full traceback for debuggability.
+            logging.exception("Error processing benchmark: %s", e)
+
+            # Optional fail-fast for debugging.
+            fail_fast = str(os.environ.get("BENCHMARK_FAIL_FAST", "0")).lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if fail_fast:
+                raise
             return
 
         self.dump_results_to_json()
@@ -1113,7 +1177,9 @@ def __run_baseline(
         llm_model_name = llm_model[1].lower()
         embedding_model_name = embedding_model[1].lower()
 
-        bge_device = os.environ.get("BGE_DEVICE")
+        # BGE device is independent from SPLITTER_DEVICE, but in practice you usually want them aligned.
+        # Override with env var BGE_DEVICE if needed.
+        bge_device = os.environ.get("BGE_DEVICE", DEFAULT_BGE_DEVICE)
         bge_device_key = bge_device if bge_device and bge_device.strip() else None
         bge_embedder = _CACHED_BGE_EMBEDDER_BY_DEVICE.get(bge_device_key)
         if bge_embedder is None:
@@ -1139,7 +1205,7 @@ def __run_baseline(
             eviction_policy=eviction_policy,
         )
     else:
-        bge_device = os.environ.get("BGE_DEVICE")
+        bge_device = os.environ.get("BGE_DEVICE", DEFAULT_BGE_DEVICE)
         bge_device_key = bge_device if bge_device and bge_device.strip() else None
         bge_embedder = _CACHED_BGE_EMBEDDER_BY_DEVICE.get(bge_device_key)
         if bge_embedder is None:
@@ -1224,8 +1290,25 @@ def __run_baseline(
 
     try:
         benchmark.test_run_benchmark(max_samples)
-    except Exception as e:
-        logging.error(f"Error running benchmark: {e}")
+    except Exception:
+        # NOTE: We intentionally log the full traceback here; otherwise failures
+        # (especially in the Splitter baseline) look like a silent early exit.
+        logging.exception(
+            "Error running benchmark baseline. "
+            "path=%s dataset_file=%s embedding_model=%s llm_model=%s",
+            path,
+            dataset_file,
+            getattr(embedding_model, "__name__", embedding_model),
+            getattr(llm_model, "__name__", llm_model),
+        )
+        # Optional fail-fast for debugging.
+        fail_fast = str(os.environ.get("BENCHMARK_FAIL_FAST", "0")).lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if fail_fast:
+            raise
 
 
 ########################################################################################################################
@@ -1715,8 +1798,11 @@ def main():
             )
 
         except Exception:
-            logging.error(
-                f"Error running benchmark. Combination {embedding_model.value[1]} {llm_model.value[1]} {dataset.value} failed."
+            logging.exception(
+                "Error running benchmark. Combination %s %s %s failed.",
+                embedding_model.value[1],
+                llm_model.value[1],
+                dataset.value,
             )
 
     total_time = (

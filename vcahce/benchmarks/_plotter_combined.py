@@ -1068,7 +1068,15 @@ def generate_combined_plots(
             vcache_splitter_run_dirs_map_override=vcache_splitter_run_dirs_map_override,
         )
     except Exception as e:
-        print(f"Error plotting cache hit vs error rate vs sample size: {e}")
+        # This plot is a nice-to-have; do not crash the whole plotting pipeline.
+        # Some result folders may not contain all deltas/configs, which can raise
+        # KeyError/ValueError in internal plotting logic.
+        try:
+            print(
+                f"Error plotting cache hit vs error rate vs sample size: {type(e).__name__}: {e}"
+            )
+        except Exception:
+            pass
 
     try:
         __plot_delta_accuracy(

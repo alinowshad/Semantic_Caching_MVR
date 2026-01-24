@@ -70,6 +70,7 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
         candidate_selection: str = "top_k",
         candidate_k: int = 10,
         use_cached_candidate_segments: bool = False,
+        score_mode: str = "avg_full_and_maxsim",
     ):
         self.bayesian = _Algorithm(delta=delta)
         self.similarity_evaluator: Optional[SimilarityEvaluator] = None
@@ -91,39 +92,57 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
         # If True, cache a candidate's MaxSim segment-embedding tensor in metadata at insert time
         # (or lazily on first use), and at query time only segment the query (single-text forward).
         self.use_cached_candidate_segments = bool(use_cached_candidate_segments)
+        # How to compute the *final* similarity score used by the Bayesian thresholding:
+        # - "avg_full_and_maxsim": 0.5 * (full cosine + symmetric MaxSim), both mapped to [0,1]
+        # - "legacy_weighted": legacy behavior (coarse weight ~0, (row+col)/2 mapped to [0,1])
+        self.score_mode = str(score_mode).lower().strip()
 
     @staticmethod
-    def _maxsim_from_tensors(query_tensor, corpus_tensor) -> float:
+    def _maxsim_from_tensors(query_tensor, corpus_tensor, *, score_mode: str = "avg_full_and_maxsim") -> float:
         """
-        Compute MaxSim similarity in [0, 1] given:
+        Compute symmetric MaxSim similarity in raw cosine space (typically [-1, 1]) given:
           - query_tensor:  [S_q+1, H] (last row is full embed)
           - corpus_tensor: [S_c+1, H] (last row is full embed)
+
+        NOTE: We intentionally treat the full embedding (last row) as an additional "segment"
+        for MaxSim, so it participates in the MaxSim row/col aggregation.
+
+        NOTE: The policy previously combined a separate "full embedding cosine" term with MaxSim
+        and optionally mapped/clamped scores. This implementation intentionally returns only the
+        symmetric MaxSim (avg of row/col) with no mapping/clamping.
         """
         import torch
         import torch.nn.functional as F
 
         dev = query_tensor.device
-        weights = torch.softmax(torch.tensor([-1e9, 0.0, 0.0], device=dev, dtype=torch.float32), dim=0)
-        w_coarse, w_row, w_col = weights.tolist()
-
         qt = query_tensor.to(dtype=torch.float32)
         ct = corpus_tensor.to(dtype=torch.float32, device=qt.device)
 
-        coarse = F.cosine_similarity(qt[-1:, :], ct[-1:, :]).squeeze()
-        query_sentence = qt[:-1, :]
-        corpus_sentence = ct[:-1, :]
-        if query_sentence.shape[0] > 0 and corpus_sentence.shape[0] > 0:
-            qn = F.normalize(query_sentence, p=2, dim=-1)
-            cn = F.normalize(corpus_sentence, p=2, dim=-1)
+        # MaxSim over *all* rows, including the last "full embedding" row.
+        query_vectors = qt
+        corpus_vectors = ct
+        if query_vectors.shape[0] > 0 and corpus_vectors.shape[0] > 0:
+            qn = F.normalize(query_vectors, p=2, dim=-1)
+            cn = F.normalize(corpus_vectors, p=2, dim=-1)
             cos = torch.mm(qn, cn.T)
-            row_score = torch.max(cos, dim=1).values.mean()
-            col_score = torch.max(cos, dim=0).values.mean()
+            # Symmetric MaxSim in [-1,1]
+            max_cos_sim_row = torch.max(cos, dim=1).values  # [Q]
+            max_cos_sim_col = torch.max(cos, dim=0).values  # [C]
+
+            # Weighted version (training-style). Cache policy has no learned per-segment weights,
+            # so we use uniform weights (equivalent to mean, but keeps the weighting structure).
+            query_weights = torch.ones(max_cos_sim_row.shape[0], device=dev, dtype=torch.float32)
+            corpus_weights = torch.ones(max_cos_sim_col.shape[0], device=dev, dtype=torch.float32)
+            row_score = torch.sum(max_cos_sim_row * query_weights) / (torch.sum(query_weights) + 1e-8)  # A->B
+            col_score = torch.sum(max_cos_sim_col * corpus_weights) / (torch.sum(corpus_weights) + 1e-8)  # B->A
         else:
             row_score = torch.tensor(0.0, device=dev)
             col_score = torch.tensor(0.0, device=dev)
 
-        raw = (w_coarse * coarse) + (w_row * row_score) + (w_col * col_score)
-        return float(torch.clamp((raw + 1.0) / 2.0, 0.0, 1.0).item())
+        # Weighted mix between row/col (uniform by default).
+        mix = torch.softmax(torch.tensor([0.0, 0.0], device=dev, dtype=torch.float32), dim=0)
+        raw = mix[0] * row_score + mix[1] * col_score
+        return float(raw.item())
 
     def _maybe_cache_candidate_segments(self, embedding_id: int) -> None:
         """
@@ -207,7 +226,7 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
             ) from e
 
         query_tensor, corpus_tensor = self.splitter.split_pair_return_maxsim_tensors(query, candidate)
-        return self._maxsim_from_tensors(query_tensor, corpus_tensor)
+        return self._maxsim_from_tensors(query_tensor, corpus_tensor, score_mode=getattr(self, "score_mode", "avg_full_and_maxsim"))
 
     def _maxsim_similarity_from_encoded(self, query_enc: dict, candidate_prompt: str) -> float:
         """
@@ -231,7 +250,7 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
             pass
 
         query_tensor, corpus_tensor = self.splitter.split_pair_return_maxsim_tensors_from_encoded(query_enc, cand_enc)
-        return self._maxsim_from_tensors(query_tensor, corpus_tensor)
+        return self._maxsim_from_tensors(query_tensor, corpus_tensor, score_mode=getattr(self, "score_mode", "avg_full_and_maxsim"))
 
     def _select_nn_by_maxsim(
         self, prompt: str
@@ -387,7 +406,7 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
                         # Fall back to existing encoded-pair path for correctness
                         s = self._maxsim_similarity_from_encoded(query_enc, cached_prompt)
                     else:
-                        s = self._maxsim_from_tensors(query_tensor, cand_tensor)
+                        s = self._maxsim_from_tensors(query_tensor, cand_tensor, score_mode=getattr(self, "score_mode", "avg_full_and_maxsim"))
                 else:
                     s = self._maxsim_similarity_from_encoded(query_enc, cached_prompt)
             except Exception as e:

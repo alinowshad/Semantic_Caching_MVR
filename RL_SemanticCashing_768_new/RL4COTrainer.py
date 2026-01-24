@@ -143,6 +143,88 @@ class ResumeFriendlyREINFORCE(REINFORCE):
             else:
                 print(f"[DEVICE] policy.embedding_model.model already on {policy_device}")
 
+    def _compute_shaped_reward_for_logging(self, td, base_reward_raw: torch.Tensor) -> torch.Tensor:
+        """Compute shaped reward using the same calibration logic as training, but safe for val/test logging.
+
+        - Does NOT backprop (uses detached tensors)
+        - If labels (`td['correct']`) are unavailable, shaped reward == base reward
+        """
+        base_reward_flat = base_reward_raw.reshape(-1)  # [B]
+        sim_for_cal = base_reward_flat  # raw similarity (can be [-1,1])
+
+        # Default: no calibration shaping if labels missing
+        r_cal = torch.zeros_like(sim_for_cal)
+
+        if hasattr(td, "keys") and ("correct" in td.keys()):
+            c = td["correct"].float().view(-1).to(sim_for_cal.device)  # [B]
+            logits = self.calibrator.logits(sim_for_cal.detach())
+
+            pos_w = float(getattr(self, "bce_pos_weight", 1.0))
+            neg_w = float(getattr(self, "bce_neg_weight", 1.0))
+
+            # Optional auto-balance weights based on batch label counts
+            auto = bool(getattr(self, "bce_auto_balance", False))
+            if auto:
+                pos_cnt = (c >= 0.5).float().sum()
+                neg_cnt = (c < 0.5).float().sum()
+                if float(pos_cnt.detach().cpu().item()) > 0.0 and float(neg_cnt.detach().cpu().item()) > 0.0:
+                    total = (pos_cnt + neg_cnt).detach()
+                    auto_pos = (total / (2.0 * pos_cnt)).detach()
+                    auto_neg = (total / (2.0 * neg_cnt)).detach()
+                    pos_w = float((auto_pos * pos_w).detach().cpu().item())
+                    neg_w = float((auto_neg * neg_w).detach().cpu().item())
+
+            w = torch.where(
+                c >= 0.5,
+                torch.full_like(c, float(pos_w)),
+                torch.full_like(c, float(neg_w)),
+            )
+            bce_per = F.binary_cross_entropy_with_logits(logits, c, weight=w, reduction="none")  # [B]
+            r_cal = (-bce_per).detach()
+
+        alpha = float(getattr(self, "alpha_cal_reward", 0.5))
+        shaped_reward_flat = sim_for_cal + alpha * r_cal
+        return shaped_reward_flat.reshape_as(base_reward_raw)
+
+    def shared_step(self, batch, batch_idx: int, phase: str, dataloader_idx: int = None):
+        """Override RL4CO shared_step so validation metric uses shaped reward (for checkpointing)."""
+        td = self.env.reset(batch)
+        out = self.policy(td, self.env, phase=phase, select_best=phase != "train")
+
+        if phase == "train":
+            # Training uses the existing loss path (includes reward shaping for REINFORCE objective).
+            out = self.calculate_loss(td, batch, out)
+        else:
+            # For val/test, compute shaped reward for logging/checkpoint selection (no backprop).
+            base_reward = out.get("reward", None)
+            if isinstance(base_reward, torch.Tensor):
+                shaped_reward = self._compute_shaped_reward_for_logging(td, base_reward)
+                out["reward"] = shaped_reward  # makes `val/reward` reflect shaped reward
+
+                # Extra visibility in TensorBoard (optional)
+                try:
+                    self.log(
+                        f"{phase}/reward_base",
+                        base_reward.detach().mean(),
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                        sync_dist=True,
+                    )
+                    self.log(
+                        f"{phase}/reward_shaped",
+                        shaped_reward.detach().mean(),
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                        sync_dist=True,
+                    )
+                except Exception:
+                    pass
+
+        metrics = self.log_metrics(out, phase, dataloader_idx=dataloader_idx)
+        return {"loss": out.get("loss", None), **metrics}
+
     def calculate_loss(
         self,
         td,
@@ -601,6 +683,15 @@ if __name__ == '__main__':
         default=None,
         help="Test parquet path (optional).",
     )
+    # Default to skipping test to avoid loading test parquet / prompts during training runs.
+    # Use `--no-skip_test` to enable test creation + `trainer.test()` + final evaluation.
+    parser.add_argument(
+        "--skip_test",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip building the test dataset/env and skip `trainer.test()` + final test-set evaluation "
+             "(default: True). Use `--no-skip_test` to run tests.",
+    )
     parser.add_argument(
         "--parquet_text_column",
         type=str,
@@ -692,6 +783,20 @@ if __name__ == '__main__':
     parser.add_argument("--nn_candidate_topk", type=int, default=50)
     parser.add_argument("--nn_rebuild_every_n_epochs", type=int, default=1)
     parser.add_argument(
+        "--nn_similarity_mode",
+        type=str,
+        default="blockwise",
+        choices=["blockwise", "full"],
+        help="How to compute embedding cosine NN for anchor_nn: 'blockwise' (low RAM) or 'full' (build full NxN matrix in RAM).",
+    )
+    parser.add_argument(
+        "--nn_similarity_dtype",
+        type=str,
+        default="float16",
+        choices=["float16", "float32"],
+        help="Dtype for the full NxN similarity matrix when --nn_similarity_mode=full.",
+    )
+    parser.add_argument(
         "--nn_full_pairwise",
         action="store_true",
         help="If set, MaxSim NN rebuild considers all prompt pairs (O(N^2), can be very slow). Otherwise uses top-k candidates by embedding similarity.",
@@ -717,6 +822,20 @@ if __name__ == '__main__':
         "--gpu_id",
         type=int,
         default=0,
+    )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        default=1,
+        help="Number of GPUs to use with Lightning DDP (e.g. 2,4). If >1, uses strategy='ddp'. "
+             "When launched under torchrun, each process should usually use --devices=1.",
+    )
+    parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable DDP find_unused_parameters. If not set, defaults to enabled when --devices > 1 "
+             "(prevents DDP unused-parameter runtime error at a small performance cost).",
     )
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -769,6 +888,8 @@ if __name__ == '__main__':
     print(f"[ARGS] nn_candidate_topk={args.nn_candidate_topk}")
     print(f"[ARGS] nn_rebuild_every_n_epochs={args.nn_rebuild_every_n_epochs}")
     print(f"[ARGS] nn_full_pairwise={args.nn_full_pairwise}")
+    print(f"[ARGS] nn_similarity_mode={args.nn_similarity_mode}")
+    print(f"[ARGS] nn_similarity_dtype={args.nn_similarity_dtype}")
     print(f"[ARGS] nn_label_strategy={args.nn_label_strategy}")
     print(f"[ARGS] split_on_space={args.split_on_space}")
     print(f"[ARGS] split_words_before={args.split_words_before}")
@@ -808,7 +929,7 @@ if __name__ == '__main__':
     if val_pairs is None and not args.val_file and not args.val_parquet:
         print("错误: 必须提供 --val_pairs_json 或 --val_file 或 --val_parquet")
         exit(1)
-    if test_pairs is None and not args.test_file and not args.test_parquet:
+    if (not args.skip_test) and (test_pairs is None) and (not args.test_file) and (not args.test_parquet):
         print("错误: 必须提供 --test_pairs_json 或 --test_file 或 --test_parquet")
         exit(1)
 
@@ -821,7 +942,7 @@ if __name__ == '__main__':
     MAX_SEGMENTS = 8  # 最大分割片段数
     TRAIN_DATA_SIZE_AVAILABLE = _infer_dataset_size(pairs=train_pairs, prompts=train_prompts, parquet_path=args.train_parquet)
     VAL_DATA_SIZE_AVAILABLE = _infer_dataset_size(pairs=val_pairs, prompts=val_prompts, parquet_path=args.val_parquet)
-    TEST_DATA_SIZE_AVAILABLE = _infer_dataset_size(pairs=test_pairs, prompts=test_prompts, parquet_path=args.test_parquet)
+    TEST_DATA_SIZE_AVAILABLE = 0 if bool(args.skip_test) else _infer_dataset_size(pairs=test_pairs, prompts=test_prompts, parquet_path=args.test_parquet)
 
     # How many samples RL4CO will generate per epoch for training.
     # - In pairs mode, generator cycles through pairs (so <= available is reasonable).
@@ -836,7 +957,15 @@ if __name__ == '__main__':
 
     # Determine device for embedding model / env.
     # IMPORTANT: Keep this consistent with Lightning's `devices` argument below.
-    GPU_ID = int(args.gpu_id)
+    # If running under DDP (Lightning spawn or torchrun), LOCAL_RANK is the per-process GPU index.
+    local_rank_env = os.environ.get("LOCAL_RANK", None)
+    if local_rank_env is not None:
+        try:
+            GPU_ID = int(local_rank_env)
+        except Exception:
+            GPU_ID = int(args.gpu_id)
+    else:
+        GPU_ID = int(args.gpu_id)
     if torch.cuda.is_available():
         n_cuda = int(torch.cuda.device_count())
         if GPU_ID < 0 or GPU_ID >= n_cuda:
@@ -844,6 +973,10 @@ if __name__ == '__main__':
                 f"Invalid --gpu_id={GPU_ID}. Visible CUDA device_count={n_cuda}. "
                 "If you set CUDA_VISIBLE_DEVICES, gpu_id is relative to the visible devices (usually start at 0)."
             )
+        try:
+            torch.cuda.set_device(GPU_ID)
+        except Exception:
+            pass
         device = torch.device(f"cuda:{GPU_ID}")
     else:
         device = torch.device("cpu")
@@ -868,6 +1001,8 @@ if __name__ == '__main__':
         nn_warmup_epochs=int(args.nn_warmup_epochs),
         nn_candidate_topk=int(args.nn_candidate_topk),
         nn_full_pairwise=bool(args.nn_full_pairwise),
+        nn_similarity_mode=str(args.nn_similarity_mode),
+        nn_similarity_dtype=str(args.nn_similarity_dtype),
         nn_rebuild_every_n_epochs=int(args.nn_rebuild_every_n_epochs),
         nn_label_strategy=str(args.nn_label_strategy),
     )
@@ -887,20 +1022,9 @@ if __name__ == '__main__':
         seed=(None if base_seed is None else base_seed + 1),
     )
     val_env = MaxSimEnv(generator=val_generator, max_segments=MAX_SEGMENTS, embedding_model=embedding_model, device=device)
-    test_generator = MaxSimGenerator(
-        prompts=test_prompts,
-        pairs=test_pairs,
-        parquet_path=args.test_parquet if test_pairs is None else None,
-        parquet_text_column=str(args.parquet_text_column),
-        label_mode=str(args.label_mode),
-        response_column=args.response_column,
-        return_row_indices=bool(args.return_row_indices),
-        sampling_mode=("pairs" if test_pairs is not None else "random"),
-        max_len=MAX_LEN,
-        embedding_model=embedding_model,
-        seed=(None if base_seed is None else base_seed + 2),
-    )
-    test_env = MaxSimEnv(generator=test_generator, max_segments=MAX_SEGMENTS, embedding_model=embedding_model, device=device)
+    # IMPORTANT: defer creating the test generator/env until AFTER training (or skip entirely).
+    # Creating it here can load the test dataset early and cause a big memory spike at "Starting training...".
+    test_env = None
 
   
     policy = AdaptedPointerNetworkPolicy(
@@ -965,10 +1089,24 @@ if __name__ == '__main__':
     log_dir = args.log_dir if args.log_dir else os.path.join(args.checkpoint_dir, "lightning_logs")
     logger = TensorBoardLogger(log_dir, name="maxsim_model")
 
+    _n_devices = int(getattr(args, "devices", 1))
+    _ddp_find_unused = getattr(args, "ddp_find_unused_parameters", None)
+    if _ddp_find_unused is None:
+        _ddp_find_unused = bool(torch.cuda.is_available() and _n_devices > 1)
+
     trainer = RL4COTrainer(
         max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=[GPU_ID] if torch.cuda.is_available() else 1,
+        # Multi-GPU: set --devices > 1 (Lightning will launch DDP).
+        # If using torchrun, pass --devices=1 and rely on LOCAL_RANK in each process.
+        devices=_n_devices if torch.cuda.is_available() else 1,
+        # Some RL4CO baselines / policies can have conditionally unused parameters.
+        # Use find_unused_parameters when requested (safer but slightly slower).
+        strategy=(
+            "ddp_find_unused_parameters_true"
+            if (torch.cuda.is_available() and _n_devices > 1 and bool(_ddp_find_unused))
+            else ("ddp" if (torch.cuda.is_available() and _n_devices > 1) else "auto")
+        ),
         logger=logger, 
 
         callbacks=[
@@ -1027,6 +1165,26 @@ if __name__ == '__main__':
         ckpt_path=args.resume_from_checkpoint
     )
     print("Training finished.")
+    if bool(args.skip_test):
+        print("[INFO] --skip_test set: skipping test dataset creation / trainer.test / final evaluation.")
+        exit(0)
+
+    # Build test env lazily (post-training) to avoid early memory usage.
+    test_generator = MaxSimGenerator(
+        prompts=test_prompts,
+        pairs=test_pairs,
+        parquet_path=args.test_parquet if test_pairs is None else None,
+        parquet_text_column=str(args.parquet_text_column),
+        label_mode=str(args.label_mode),
+        response_column=args.response_column,
+        return_row_indices=bool(args.return_row_indices),
+        sampling_mode=("pairs" if test_pairs is not None else "random"),
+        max_len=MAX_LEN,
+        embedding_model=embedding_model,
+        seed=(None if base_seed is None else base_seed + 2),
+    )
+    test_env = MaxSimEnv(generator=test_generator, max_segments=MAX_SEGMENTS, embedding_model=embedding_model, device=device)
+
     test_size = int(TEST_DATA_SIZE_AVAILABLE)
     test_dataset = test_env.dataset(test_size, phase="test")
     test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, num_workers=0, collate_fn=test_dataset.collate_fn)

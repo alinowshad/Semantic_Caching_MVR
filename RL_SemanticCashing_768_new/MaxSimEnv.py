@@ -2,7 +2,9 @@ import torch
 import torch.nn.functional as F
 import sys
 import os
+import numpy as np
 from tensordict.tensordict import TensorDict
+from torch.utils.data import Dataset
 from torchrl.data import (
     BoundedTensorSpec,
     CompositeSpec,
@@ -129,6 +131,90 @@ class MaxSimEnv(RL4COEnvBase):
         
     
         self._make_spec(self.generator)
+
+    def dataset(self, size: int | None = None, phase: str = "train", **kwargs):
+        """
+        Return a **lazy** dataset that generates samples on-the-fly instead of pre-materializing
+        many samples in memory.
+
+        Compatibility:
+        - RL4CO sometimes calls `env.dataset(batch_size=[N])` (baseline setup).
+        - Some codepaths call `env.dataset(N, phase="val")`.
+        """
+
+        # RL4CO compatibility: allow `batch_size=[N]` as an alternative to passing `size` directly.
+        if size is None:
+            bs = kwargs.get("batch_size", None)
+            if isinstance(bs, (list, tuple)) and len(bs) > 0:
+                size = int(bs[0])
+            elif isinstance(bs, torch.Size) and len(bs) > 0:
+                size = int(bs[0])
+            elif isinstance(bs, int):
+                size = int(bs)
+            else:
+                raise TypeError(
+                    "MaxSimEnv.dataset() requires either `size` or `batch_size=[N]`."
+                )
+        size = int(size)
+
+        class _OnTheFlyTensorDictDataset(Dataset):
+            def __init__(self, *, generator: MaxSimGenerator, size: int, phase: str, extra: dict | None = None):
+                self.generator = generator
+                self.size = int(size)
+                self.phase = str(phase)
+                self._extra = dict(extra or {})
+
+                # Stable seed so __getitem__(idx) is deterministic -> required for RL4CO rollout baselines
+                # that compute rewards and then call dataset.add_key("extra", rewards).
+                base = getattr(generator, "seed", None)
+                self._base_seed = int(base) if isinstance(base, int) else 0
+
+            def add_key(self, key: str, value: torch.Tensor):
+                """
+                RL4CO baseline compatibility: return a new dataset that serves `value[idx]`
+                under `key` in each sample.
+                """
+                return _OnTheFlyTensorDictDataset(
+                    generator=self.generator,
+                    size=self.size,
+                    phase=self.phase,
+                    extra={**self._extra, str(key): value},
+                )
+
+            def __len__(self):
+                return self.size
+
+            def __getitem__(self, idx):
+                # Deterministic per-index sampling so external per-index tensors (e.g., "extra")
+                # align with the exact sample at that index.
+                idx = int(idx)
+                seed = (self._base_seed + 1_000_003 * idx) & 0xFFFFFFFF
+
+                # Temporarily swap generator RNG for reproducible sampling.
+                old_rng = getattr(self.generator, "_sample_rng", None)
+                try:
+                    self.generator._sample_rng = np.random.default_rng(seed)
+                    td = self.generator(batch_size=1)
+                finally:
+                    if old_rng is not None:
+                        self.generator._sample_rng = old_rng
+
+                # Attach any extra per-index tensors (e.g., baseline rewards).
+                if self._extra:
+                    for k, v in self._extra.items():
+                        if torch.is_tensor(v):
+                            td[str(k)] = v[idx : idx + 1].to(td.device)
+                        else:
+                            td[str(k)] = v
+                return td
+
+            @staticmethod
+            def collate_fn(batch):
+                # Batch is a list[TensorDict] where each item has batch_size=[1].
+                # Concatenate along batch dimension.
+                return TensorDict.cat(batch, dim=0)
+
+        return _OnTheFlyTensorDictDataset(generator=self.generator, size=size, phase=str(phase))
     def _reset(self, td: TensorDict = None, batch_size=None) -> TensorDict:
     
         if td is None:
@@ -272,39 +358,60 @@ class MaxSimEnv(RL4COEnvBase):
                      corpus_weights: torch.Tensor,
                      times: int = 0) -> torch.Tensor:
         """
-        计算query和corpus之间基于粗粒度和细粒度嵌入的加权相似度分数。
+        Compute weighted symmetric MaxSim score in raw cosine space (typically [-1, 1]).
+
+        Changes vs the previous implementation:
+        - Remove the separate coarse-grained full-vector cosine term.
+        - Include the full pooled vector (last row) as an additional "segment" that participates
+          in the MaxSim row/col aggregation.
         """
        
-        weights = F.softmax(self.score_weights_raw, dim=0)
-        w_coarse = weights[0]
-        w_fine_row = weights[1]
-        w_fine_col = weights[2]
+        # Keep score_weights_raw shape unchanged for compatibility, but only use fine weights.
+        fine_mix = F.softmax(self.score_weights_raw[1:], dim=0)  # [row, col]
+        w_fine_row = fine_mix[0]
+        w_fine_col = fine_mix[1]
 
-        query_full_vec = query_tensor[-1:, :]
-        corpus_full_vec = sub_corpus_embeddings[-1:, :]
-        coarse_grained_score = F.cosine_similarity(query_full_vec, corpus_full_vec).squeeze()
+        # Include the full pooled vector (last row) as an additional segment for MaxSim.
+        query_vecs = query_tensor
+        corpus_vecs = sub_corpus_embeddings
 
-        query_sentence_vecs = query_tensor[:-1, :]
-        corpus_sentence_vecs = sub_corpus_embeddings[:-1, :]
+        # Ensure weights cover all vectors (append 1.0 weight for the full vector if needed).
+        if query_weights is None:
+            query_weights = torch.ones(query_vecs.shape[0], device=query_vecs.device, dtype=torch.float32)
+        if corpus_weights is None:
+            corpus_weights = torch.ones(corpus_vecs.shape[0], device=corpus_vecs.device, dtype=torch.float32)
 
-        if query_sentence_vecs.shape[0] > 0 and corpus_sentence_vecs.shape[0] > 0:
-            query_norm = F.normalize(query_sentence_vecs, p=2, dim=-1)
-            corpus_norm = F.normalize(corpus_sentence_vecs, p=2, dim=-1)
+        if query_weights.dim() == 1 and query_weights.shape[0] == max(0, query_vecs.shape[0] - 1):
+            query_weights = torch.cat(
+                [query_weights.to(dtype=torch.float32), torch.ones(1, device=query_vecs.device, dtype=torch.float32)],
+                dim=0,
+            )
+        else:
+            query_weights = query_weights.to(dtype=torch.float32)
+
+        if corpus_weights.dim() == 1 and corpus_weights.shape[0] == max(0, corpus_vecs.shape[0] - 1):
+            corpus_weights = torch.cat(
+                [corpus_weights.to(dtype=torch.float32), torch.ones(1, device=corpus_vecs.device, dtype=torch.float32)],
+                dim=0,
+            )
+        else:
+            corpus_weights = corpus_weights.to(dtype=torch.float32)
+
+        if query_vecs.shape[0] > 0 and corpus_vecs.shape[0] > 0:
+            query_norm = F.normalize(query_vecs, p=2, dim=-1)
+            corpus_norm = F.normalize(corpus_vecs, p=2, dim=-1)
             cos_sim_matrix = torch.mm(query_norm, corpus_norm.T)
 
-            max_cos_sim_row = torch.max(cos_sim_matrix, dim=1).values
+            max_cos_sim_row = torch.max(cos_sim_matrix, dim=1).values  # [Q]
             fine_grained_row_score = torch.sum(max_cos_sim_row * query_weights) / (torch.sum(query_weights) + 1e-8)
 
-            max_cos_sim_col = torch.max(cos_sim_matrix, dim=0).values
+            max_cos_sim_col = torch.max(cos_sim_matrix, dim=0).values  # [C]
             fine_grained_col_score = torch.sum(max_cos_sim_col * corpus_weights) / (torch.sum(corpus_weights) + 1e-8)
         else:
             fine_grained_row_score = torch.tensor(0.0, device=self.device)
             fine_grained_col_score = torch.tensor(0.0, device=self.device)
 
-      
-        final_score = (w_coarse * coarse_grained_score +
-                       w_fine_row * fine_grained_row_score +
-                       w_fine_col * fine_grained_col_score)
+        final_score = (w_fine_row * fine_grained_row_score + w_fine_col * fine_grained_col_score)
 
         return final_score
 

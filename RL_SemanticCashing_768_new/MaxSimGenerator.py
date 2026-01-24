@@ -38,6 +38,8 @@ class MaxSimGenerator(Generator):
         nn_warmup_epochs: int = 5,
         nn_candidate_topk: int = 50,
         nn_full_pairwise: bool = False,
+        nn_similarity_mode: str = "blockwise",  # blockwise|full
+        nn_similarity_dtype: str = "float16",   # float16|float32 (only for mode=full)
         nn_rebuild_every_n_epochs: int = 1,
         nn_label_strategy: str = "skip",  # skip|zero
         max_len=128,
@@ -59,6 +61,16 @@ class MaxSimGenerator(Generator):
         self.nn_warmup_epochs = int(nn_warmup_epochs)
         self.nn_candidate_topk = int(nn_candidate_topk)
         self.nn_full_pairwise = bool(nn_full_pairwise)
+        self.nn_similarity_mode = str(nn_similarity_mode).lower().strip()
+        self.nn_similarity_dtype = str(nn_similarity_dtype).lower().strip()
+        if self.nn_similarity_mode not in {"blockwise", "full"}:
+            raise ValueError(
+                f"Unsupported nn_similarity_mode={nn_similarity_mode!r}. Use 'blockwise' or 'full'."
+            )
+        if self.nn_similarity_dtype not in {"float16", "float32"}:
+            raise ValueError(
+                f"Unsupported nn_similarity_dtype={nn_similarity_dtype!r}. Use 'float16' or 'float32'."
+            )
         self.nn_rebuild_every_n_epochs = max(1, int(nn_rebuild_every_n_epochs))
         self.nn_label_strategy = str(nn_label_strategy).lower().strip()
         if self.nn_label_strategy not in {"skip", "zero"}:
@@ -304,13 +316,96 @@ class MaxSimGenerator(Generator):
         if N < 2:
             raise RuntimeError("Need at least 2 prompts for anchor_nn sampling.")
 
+        def _full_similarity_matrix_topk(
+            emb: torch.Tensor,
+            *,
+            k: int,
+            dtype: str,
+        ) -> torch.LongTensor:
+            """
+            Build the full NxN similarity matrix in RAM (cosine via dot on normalized vectors),
+            exclude diagonal, and return top-k indices [N,k].
+
+            WARNING: O(N^2) memory. For N=30k:
+              - float32: ~3.6GB
+              - float16: ~1.8GB
+            """
+            n = int(emb.shape[0])
+            kk = int(max(1, min(k, n - 1)))
+            emb2 = emb
+            if dtype == "float16":
+                emb2 = emb2.to(dtype=torch.float16)
+            else:
+                emb2 = emb2.to(dtype=torch.float32)
+            sim = emb2 @ emb2.T  # [N,N]
+            # Exclude self
+            sim.fill_diagonal_(-1e9)
+            return torch.topk(sim, k=kk, dim=1).indices.to("cpu")
+
+        def _topk_blockwise(
+            emb: torch.Tensor,
+            *,
+            k: int,
+            block_rows: int = 256,
+            block_cols: int = 4096,
+        ) -> torch.LongTensor:
+            """
+            Compute top-k cosine neighbors for each row of `emb` WITHOUT building the full NxN matrix.
+
+            Assumes `emb` is L2-normalized on CPU (so dot == cosine similarity).
+            Returns indices [N, k] on CPU, excluding self.
+            """
+            if emb.dim() != 2:
+                raise ValueError(f"Expected emb [N,D], got shape={tuple(emb.shape)}")
+            n = int(emb.shape[0])
+            kk = int(max(1, min(k, n - 1)))
+            out = torch.empty((n, kk), dtype=torch.long, device="cpu")
+
+            emb = emb.contiguous()
+
+            for i0 in range(0, n, int(block_rows)):
+                i1 = min(n, i0 + int(block_rows))
+                q = emb[i0:i1]  # [Br,D]
+                br = int(q.shape[0])
+
+                best_vals = torch.full((br, kk), -1e9, dtype=torch.float32)
+                best_idx = torch.full((br, kk), -1, dtype=torch.long)
+
+                for j0 in range(0, n, int(block_cols)):
+                    j1 = min(n, j0 + int(block_cols))
+                    c = emb[j0:j1]  # [Bc,D]
+                    scores = q @ c.T  # [Br,Bc]
+
+                    # Exclude self if it falls inside this column block.
+                    if not (j1 <= i0 or j0 >= i1):
+                        for r in range(br):
+                            gi = i0 + r
+                            if j0 <= gi < j1:
+                                scores[r, gi - j0] = -1e9
+
+                    local_k = min(kk, int(scores.shape[1]))
+                    local_vals, local_pos = torch.topk(scores, k=local_k, dim=1)
+                    local_idx = local_pos.to(torch.long) + int(j0)
+
+                    merged_vals = torch.cat([best_vals, local_vals], dim=1)
+                    merged_idx = torch.cat([best_idx, local_idx], dim=1)
+                    new_vals, new_pos = torch.topk(merged_vals, k=kk, dim=1)
+                    new_idx = merged_idx.gather(1, new_pos)
+                    best_vals, best_idx = new_vals, new_idx
+
+                out[i0:i1] = best_idx
+
+            return out
+
         # -------- Warmup: embedding cosine NN --------
         if epoch < self.nn_warmup_epochs or policy is None or env is None:
-            # sim = emb @ emb.T ; take argmax excluding self
-            sim = self._emb_all @ self._emb_all.T  # [N,N]
-            sim.fill_diagonal_(-1e9)
-            nn = torch.argmax(sim, dim=1).long().cpu()  # [N]
-            self._nn_forward = nn
+            if self.nn_similarity_mode == "full":
+                top1 = _full_similarity_matrix_topk(
+                    self._emb_all, k=1, dtype=self.nn_similarity_dtype
+                )
+            else:
+                top1 = _topk_blockwise(self._emb_all, k=1)  # [N,1]
+            self._nn_forward = top1[:, 0].long().cpu()
         else:
             # -------- After warmup: MaxSim NN over candidates --------
             # Candidate selection: either full pairwise (expensive) or top-k by embedding sim.
@@ -322,14 +417,15 @@ class MaxSimGenerator(Generator):
 
             # Precompute top-k candidates by embedding sim (on CPU)
             emb = self._emb_all
-            sim = emb @ emb.T  # [N,N]
-            sim.fill_diagonal_(-1e9)
 
             if self.nn_full_pairwise:
                 cand_lists = [torch.tensor([j for j in range(N) if j != i], dtype=torch.long) for i in range(N)]
             else:
                 k = max(1, min(self.nn_candidate_topk, N - 1))
-                topk = torch.topk(sim, k=k, dim=1).indices.cpu()  # [N,k]
+                if self.nn_similarity_mode == "full":
+                    topk = _full_similarity_matrix_topk(emb, k=k, dtype=self.nn_similarity_dtype)
+                else:
+                    topk = _topk_blockwise(emb, k=k)  # [N,k]
                 cand_lists = [topk[i] for i in range(N)]
 
             nn_out = torch.empty(N, dtype=torch.long)

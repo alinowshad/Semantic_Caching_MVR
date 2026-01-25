@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
@@ -136,7 +137,7 @@ def main() -> None:
     parser.add_argument(
         "--dataset",
         required=True,
-        help="HF dataset id, e.g. vCache/SemBenchmarkClassification",
+        help="HF dataset id (e.g. vCache/SemBenchmarkClassification) OR a local .csv/.parquet file path.",
     )
     parser.add_argument(
         "--embedding-col",
@@ -176,26 +177,89 @@ def main() -> None:
         default=None,
         help="Path to save per-sample results for curve plotting.",
     )
+    parser.add_argument(
+        "--save-cache-hit-samples",
+        type=str,
+        default=None,
+        help="If set, write ALL cache-hit samples to this path as JSONL (one record per hit).",
+    )
     args = parser.parse_args()
 
     # Mirror: must be set before importing HF libs in a fresh process.
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-    cache_paths = _ensure_hf_cache_env()
+    # Load dataset: support both HF dataset IDs and local CSV/parquet files.
+    dataset_is_local_file = False
+    try:
+        dataset_is_local_file = os.path.exists(str(args.dataset))
+    except Exception:
+        dataset_is_local_file = False
+    if str(args.dataset).endswith(".csv") or str(args.dataset).endswith(".parquet"):
+        dataset_is_local_file = True
 
-    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+    if dataset_is_local_file:
+        dataset_path = os.path.abspath(str(args.dataset))
+        if dataset_path.endswith(".csv"):
+            try:
+                df = pd.read_csv(dataset_path)
+            except Exception:
+                # More tolerant CSV parsing for large / messy files
+                df = pd.read_csv(
+                    dataset_path,
+                    engine="python",
+                    on_bad_lines="skip",
+                    low_memory=False,
+                )
+        elif dataset_path.endswith(".parquet"):
+            df = pd.read_parquet(dataset_path)
+        else:
+            raise ValueError(
+                f"Unsupported local dataset file format: {dataset_path} (expected .csv or .parquet)"
+            )
 
-    # Load dataset
-    split = "train"
-    if args.max_samples is not None:
-        split = f"train[:{args.max_samples}]"
+        if "prompt" not in df.columns:
+            raise ValueError(
+                f"Local dataset is missing required column 'prompt'. Available columns: {list(df.columns)}"
+            )
+        if args.llm_col not in df.columns:
+            raise ValueError(
+                f"Local dataset is missing required LLM response column '{args.llm_col}'. Available columns: {list(df.columns)}"
+            )
 
-    rows = load_dataset(
-        args.dataset,
-        split=split,
-        cache_dir=cache_paths["DATASETS_CACHE"],
-        token=hf_token,
-    )
+        # If user asked for benchmark_id_set but the file doesn't have usable ids, fall back to string.
+        id_col = None
+        if "ID_Set" in df.columns:
+            id_col = "ID_Set"
+        elif "id_set" in df.columns:
+            id_col = "id_set"
+        if args.similarity_evaluator == "benchmark_id_set":
+            has_usable_ids = False
+            if id_col is not None:
+                try:
+                    s = pd.to_numeric(df[id_col], errors="coerce").fillna(-1)
+                    has_usable_ids = bool((s.astype(int) != -1).any())
+                except Exception:
+                    has_usable_ids = False
+            if not has_usable_ids:
+                args.similarity_evaluator = "string"
+
+        rows = df.to_dict("records")
+        if args.max_samples is not None:
+            rows = rows[: int(args.max_samples)]
+    else:
+        cache_paths = _ensure_hf_cache_env()
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+
+        split = "train"
+        if args.max_samples is not None:
+            split = f"train[:{args.max_samples}]"
+
+        rows = load_dataset(
+            args.dataset,
+            split=split,
+            cache_dir=cache_paths["DATASETS_CACHE"],
+            token=hf_token,
+        )
 
     # Build vCache with benchmark engines (offline eval)
     inference_engine = BenchmarkInferenceEngine()
@@ -229,60 +293,97 @@ def main() -> None:
     n = 0
     per_sample_results = []
 
+    hit_samples_f = None
+    hit_samples_path = None
+    if args.save_cache_hit_samples:
+        hit_samples_path = os.path.abspath(str(args.save_cache_hit_samples))
+        hit_dir = os.path.dirname(hit_samples_path)
+        if hit_dir:
+            os.makedirs(hit_dir, exist_ok=True)
+        hit_samples_f = open(hit_samples_path, "w", encoding="utf-8")
+
     t0 = time.time()
     pbar = tqdm(rows, desc="Evaluating", unit="samples")
-    for r in pbar:
-        prompt = r["prompt"]
-        system_prompt = r.get("output_format", "") or ""
-        id_set = _get_id_set(r)
+    try:
+        for r in pbar:
+            prompt = r["prompt"]
+            system_prompt = r.get("output_format", "") or ""
+            id_set = _get_id_set(r)
 
-        label_response = r[args.llm_col]
+            label_response = r[args.llm_col]
 
-        # Inject ground truth response for the benchmark engine
-        inference_engine.set_next_response(label_response)
+            # Inject ground truth response for the benchmark engine
+            inference_engine.set_next_response(label_response)
 
-        is_hit, resp, resp_meta, nn_meta = vcache.infer_with_cache_info(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            id_set=id_set,
-        )
+            is_hit, resp, resp_meta, nn_meta = vcache.infer_with_cache_info(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                id_set=id_set,
+            )
 
-        n += 1
-        hits += int(is_hit)
-        d_tp, d_fp, d_tn, d_fn = _score_step(
-            is_cache_hit=is_hit,
-            label_id_set=id_set,
-            label_response=label_response,
-            cache_response=resp,
-            response_metadata=resp_meta,
-            nn_metadata=nn_meta,
-        )
-        tp += d_tp
-        fp += d_fp
-        tn += d_tn
-        fn += d_fn
+            n += 1
+            hits += int(is_hit)
+            d_tp, d_fp, d_tn, d_fn = _score_step(
+                is_cache_hit=is_hit,
+                label_id_set=id_set,
+                label_response=label_response,
+                cache_response=resp,
+                response_metadata=resp_meta,
+                nn_metadata=nn_meta,
+            )
+            tp += d_tp
+            fp += d_fp
+            tn += d_tn
+            fn += d_fn
 
-        # Track per-sample result
-        per_sample_results.append({
-            "sample_index": n,
-            "is_hit": is_hit,
-            "running_hit_rate": hits / n,
-            "tp": d_tp,
-            "fp": d_fp,
-            "tn": d_tn,
-            "fn": d_fn
-        })
+            # Optional: dump every cache hit sample to JSONL for later inspection.
+            if bool(is_hit) and hit_samples_f is not None:
+                rec = {
+                    "sample_index": int(n),
+                    "delta": float(args.delta),
+                    "prompt": prompt,
+                    "system_prompt": system_prompt,
+                    "label_id_set": int(id_set),
+                    "label_response": label_response,
+                    "cached_embedding_id": int(getattr(resp_meta, "embedding_id", -1)),
+                    "cached_id_set": int(getattr(resp_meta, "id_set", -1)),
+                    "cached_prompt": getattr(resp_meta, "prompt", "") or "",
+                    "cached_response": resp,
+                    "t_hat": getattr(resp_meta, "t_hat", None),
+                    "t_prime": getattr(resp_meta, "t_prime", None),
+                    "gamma": getattr(resp_meta, "gamma", None),
+                    "var_t": getattr(resp_meta, "var_t", None),
+                }
+                hit_samples_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-        # Update progress bar stats
-        pbar.set_postfix({
-            "hits": f"{hits}/{n}",
-            "hit_rate": f"{(hits/n):.1%}"
-        })
+            # Track per-sample result
+            per_sample_results.append({
+                "sample_index": n,
+                "is_hit": is_hit,
+                "running_hit_rate": hits / n,
+                "tp": d_tp,
+                "fp": d_fp,
+                "tn": d_tn,
+                "fn": d_fn
+            })
 
-        # VerifiedDecisionPolicy updates cache metadata asynchronously; a tiny sleep (as in benchmark.py)
-        # prevents the evaluation loop from outrunning the background worker and biasing toward EXPLORE.
-        if args.sleep and args.sleep > 0:
-            time.sleep(float(args.sleep))
+            # Update progress bar stats
+            pbar.set_postfix({
+                "hits": f"{hits}/{n}",
+                "hit_rate": f"{(hits/n):.1%}"
+            })
+
+            # VerifiedDecisionPolicy updates cache metadata asynchronously; a tiny sleep (as in benchmark.py)
+            # prevents the evaluation loop from outrunning the background worker and biasing toward EXPLORE.
+            if args.sleep and args.sleep > 0:
+                time.sleep(float(args.sleep))
+    finally:
+        if hit_samples_f is not None:
+            try:
+                hit_samples_f.close()
+                print(f"Cache-hit samples saved to {hit_samples_path}")
+            except Exception:
+                pass
 
     elapsed = time.time() - t0
 

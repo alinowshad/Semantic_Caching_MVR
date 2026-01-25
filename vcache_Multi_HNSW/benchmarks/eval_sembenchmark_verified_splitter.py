@@ -220,6 +220,13 @@ def main() -> None:
         help="Device for MaxSimSplitter (e.g. cpu, cuda).",
     )
     parser.add_argument(
+        "--splitter-overlap-tokens",
+        type=int,
+        default=0,
+        help="Allow overlapping segments by this many tokens on each segment boundary (default: 0). "
+             "Set to 1 to allow 1-token overlap.",
+    )
+    parser.add_argument(
         "--candidate-selection",
         choices=["top_k", "all", "multivector_top_k"],
         default="top_k",
@@ -285,6 +292,15 @@ def main() -> None:
         type=str,
         default=None,
         help="Timestamp string used in results_<timestamp>.json when --benchmark-output-dir is set. Default matches benchmark.py format: YYYY-MM-DD_HH-MM",
+    )
+    parser.add_argument(
+        "--save-cache-hit-samples",
+        type=str,
+        default=None,
+        help=(
+            "If set, write ALL cache-hit samples to this path as JSONL (one record per hit). "
+            "If you pass a directory, it will create one file per (delta,candidate_k) run."
+        ),
     )
     args = parser.parse_args()
 
@@ -384,6 +400,7 @@ def main() -> None:
         checkpoint_path=args.splitter_checkpoint,
         device=args.splitter_device,
         embedding_model=shared_embedder,
+        overlap_tokens=int(args.splitter_overlap_tokens),
     )
 
     if args.similarity_evaluator == "string":
@@ -425,6 +442,32 @@ def main() -> None:
         out_dir = os.path.join(base_dir, dir_name)
         os.makedirs(out_dir, exist_ok=True)
         return out_dir
+
+    def _resolve_hit_samples_path(*, delta: float, candidate_k: int) -> str | None:
+        """
+        Resolve output path for cache-hit sample dump.
+        Mirrors _resolve_output_path behavior:
+        - If base is a directory, create per-run filename inside it.
+        - If base is a file path and multiple runs, suffix it with delta/k.
+        """
+        if not args.save_cache_hit_samples:
+            return None
+        base = str(args.save_cache_hit_samples)
+        if len(run_grid) <= 1:
+            return base
+
+        base_abs = os.path.abspath(base)
+        if base_abs.endswith(os.sep) or os.path.isdir(base_abs):
+            os.makedirs(base_abs, exist_ok=True)
+            name = f"cache_hit_samples_delta{delta}_k{candidate_k}.jsonl"
+            return os.path.join(base_abs, name)
+
+        root, ext = os.path.splitext(base)
+        ext = ext if ext else ".jsonl"
+        # Ensure jsonl extension unless user explicitly gave something else
+        if ext.lower() == ".json":
+            ext = ".jsonl"
+        return f"{root}_delta{delta}_k{candidate_k}{ext}"
 
     def _compute_statistics_json(
         *,
@@ -571,68 +614,107 @@ def main() -> None:
         latency_direct_list: list[float] = []
         latency_vectorq_list: list[float] = []
 
+        hit_samples_path = _resolve_hit_samples_path(delta=float(delta), candidate_k=int(candidate_k))
+        hit_samples_f = None
+        if hit_samples_path:
+            hit_dir = os.path.dirname(os.path.abspath(hit_samples_path))
+            if hit_dir:
+                os.makedirs(hit_dir, exist_ok=True)
+            hit_samples_f = open(hit_samples_path, "w", encoding="utf-8")
+
         t0 = time.time()
         pbar = tqdm(
             rows,
             desc=f"Evaluating (Splitter) run={run_i}/{len(run_grid)} delta={delta} k={candidate_k}",
             unit="samples",
         )
-        for r in pbar:
-            prompt = r["prompt"]
-            system_prompt = r.get("output_format", "") or ""
-            id_set = _get_id_set(r)
+        try:
+            for r in pbar:
+                prompt = r["prompt"]
+                system_prompt = r.get("output_format", "") or ""
+                id_set = _get_id_set(r)
 
-            label_response = r[args.llm_col]
-            inference_engine.set_next_response(label_response)
+                label_response = r[args.llm_col]
+                inference_engine.set_next_response(label_response)
 
-            step_t0 = time.time()
-            is_hit, resp, resp_meta, nn_meta = vcache.infer_with_cache_info(
-                prompt=prompt,
-                system_prompt=system_prompt,
-                id_set=id_set,
-            )
-            step_latency = time.time() - step_t0
+                step_t0 = time.time()
+                is_hit, resp, resp_meta, nn_meta = vcache.infer_with_cache_info(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    id_set=id_set,
+                )
+                step_latency = time.time() - step_t0
 
-            n += 1
-            hits += int(is_hit)
-            d_tp, d_fp, d_tn, d_fn = _score_step(
-                is_cache_hit=is_hit,
-                label_id_set=id_set,
-                label_response=label_response,
-                cache_response=resp,
-                response_metadata=resp_meta,
-                nn_metadata=nn_meta,
-            )
-            tp += d_tp
-            fp += d_fp
-            tn += d_tn
-            fn += d_fn
+                n += 1
+                hits += int(is_hit)
+                d_tp, d_fp, d_tn, d_fn = _score_step(
+                    is_cache_hit=is_hit,
+                    label_id_set=id_set,
+                    label_response=label_response,
+                    cache_response=resp,
+                    response_metadata=resp_meta,
+                    nn_metadata=nn_meta,
+                )
+                tp += d_tp
+                fp += d_fp
+                tn += d_tn
+                fn += d_fn
 
-            cache_hit_list.append(int(bool(is_hit)))
-            cache_miss_list.append(int(not bool(is_hit)))
-            tp_list.append(int(d_tp))
-            fp_list.append(int(d_fp))
-            tn_list.append(int(d_tn))
-            fn_list.append(int(d_fn))
-            latency_direct_list.append(float(step_latency))
-            latency_vectorq_list.append(float(step_latency))
+                cache_hit_list.append(int(bool(is_hit)))
+                cache_miss_list.append(int(not bool(is_hit)))
+                tp_list.append(int(d_tp))
+                fp_list.append(int(d_fp))
+                tn_list.append(int(d_tn))
+                fn_list.append(int(d_fn))
+                latency_direct_list.append(float(step_latency))
+                latency_vectorq_list.append(float(step_latency))
 
-            per_sample_results.append(
-                {
-                    "sample_index": n,
-                    "is_hit": is_hit,
-                    "running_hit_rate": hits / n,
-                    "tp": d_tp,
-                    "fp": d_fp,
-                    "tn": d_tn,
-                    "fn": d_fn,
-                }
-            )
+                per_sample_results.append(
+                    {
+                        "sample_index": n,
+                        "is_hit": is_hit,
+                        "running_hit_rate": hits / n,
+                        "tp": d_tp,
+                        "fp": d_fp,
+                        "tn": d_tn,
+                        "fn": d_fn,
+                    }
+                )
 
-            pbar.set_postfix({"hits": f"{hits}/{n}", "hit_rate": f"{(hits/n):.1%}"})
+                # Optional: dump every cache hit sample to JSONL for later inspection.
+                if bool(is_hit) and hit_samples_f is not None:
+                    rec = {
+                        "sample_index": int(n),
+                        "delta": float(delta),
+                        "candidate_k": int(candidate_k),
+                        "candidate_selection": str(args.candidate_selection),
+                        "prompt": prompt,
+                        "system_prompt": system_prompt,
+                        "label_id_set": int(id_set),
+                        "label_response": label_response,
+                        "cached_embedding_id": int(getattr(resp_meta, "embedding_id", -1)),
+                        "cached_id_set": int(getattr(resp_meta, "id_set", -1)),
+                        "cached_prompt": getattr(resp_meta, "prompt", "") or "",
+                        "cached_response": resp,
+                        # Useful policy state (if present)
+                        "t_hat": getattr(resp_meta, "t_hat", None),
+                        "t_prime": getattr(resp_meta, "t_prime", None),
+                        "gamma": getattr(resp_meta, "gamma", None),
+                        "var_t": getattr(resp_meta, "var_t", None),
+                    }
+                    hit_samples_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-            if args.sleep and args.sleep > 0:
-                time.sleep(float(args.sleep))
+                pbar.set_postfix({"hits": f"{hits}/{n}", "hit_rate": f"{(hits/n):.1%}"})
+
+                if args.sleep and args.sleep > 0:
+                    time.sleep(float(args.sleep))
+        finally:
+            if hit_samples_f is not None:
+                try:
+                    hit_samples_f.close()
+                    print(f"Cache-hit samples saved to {hit_samples_path}")
+                except Exception:
+                    pass
 
         elapsed = time.time() - t0
 

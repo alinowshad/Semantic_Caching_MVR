@@ -98,9 +98,10 @@ def _resolve_checkpoint_path(checkpoint_path: str) -> str:
 
     raise FileNotFoundError(f"Checkpoint path not found: {p}")
 class MaxSimSplitter:
-    def __init__(self, checkpoint_path, device="cuda", embedding_model=None):
+    def __init__(self, checkpoint_path, device="cuda", embedding_model=None, *, overlap_tokens: int = 0):
         # Normalize device early so all downstream `.to(...)` calls are consistent.
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
+        self.overlap_tokens = max(0, int(overlap_tokens))
         resolved_ckpt = _resolve_checkpoint_path(checkpoint_path)
         print(f"正在加载分句模型: {resolved_ckpt} ...")
         
@@ -331,45 +332,12 @@ class MaxSimSplitter:
                 return int(L)
 
         def _segment_embeds(token_emb: torch.Tensor, attn, pointers: list) -> tuple[torch.Tensor, torch.Tensor]:
-            """
-            Returns:
-              - sentence_embeds: [S, H]
-              - full_embed:      [1, H]
-            Pointer semantics match `get_segments_from_token_pointers`:
-              - skip [CLS] at position 0
-              - pointer p is inclusive end boundary => slice ends at p+1
-            """
             L = token_emb.shape[0]
             length = _length(attn, L)
             length = max(0, min(int(length), int(L)))
-
-            # If effectively empty (or only [CLS]), fall back to zeros.
-            H = token_emb.shape[1]
-            if length <= 1:
-                zero = torch.zeros((1, H), device=token_emb.device, dtype=token_emb.dtype)
-                return zero, zero
-
-            valid_pointers = sorted({int(p) for p in pointers if 0 <= int(p) < length})
-
-            segs: list[torch.Tensor] = []
-            prev = 0
-            for p in valid_pointers:
-                real_start = (prev + 1) if prev > 0 else 1
-                real_end = p + 1
-                if real_end > real_start:
-                    segs.append(token_emb[real_start:real_end, :].mean(dim=0))
-                prev = p
-
-            tail_start = (prev + 1) if prev > 0 else 1
-            if tail_start < length:
-                segs.append(token_emb[tail_start:length, :].mean(dim=0))
-
-            if not segs:
-                segs = [token_emb[1:length, :].mean(dim=0)]
-
-            sentence_embeds = torch.stack(segs, dim=0)  # [S, H]
-            full_embed = token_emb[1:length, :].mean(dim=0, keepdim=True)  # [1, H]
-            return sentence_embeds, full_embed
+            return self._segment_embeds_from_pointers(
+                token_emb, length, pointers, overlap_tokens=self.overlap_tokens
+            )
 
         sent_a, full_a = _segment_embeds(token_emb_a, attn_a, pointers_a)
         sent_b, full_b = _segment_embeds(token_emb_b, attn_b, pointers_b)
@@ -437,7 +405,7 @@ class MaxSimSplitter:
         }
 
     @staticmethod
-    def _segment_embeds_from_pointers(token_emb, length: int, pointers: list):
+    def _segment_embeds_from_pointers(token_emb, length: int, pointers: list, *, overlap_tokens: int = 0):
         """
         Convert token-level embeddings + pointer indices into:
           - sentence_embeds: [S, H] (segment-level mean pooled embeddings)
@@ -448,6 +416,7 @@ class MaxSimSplitter:
           - pointer p is an inclusive end boundary => slice ends at p+1
         """
         import torch
+        overlap_tokens = max(0, int(overlap_tokens))
 
         length = max(0, min(int(length), int(token_emb.shape[0])))
         H = int(token_emb.shape[1])
@@ -459,13 +428,18 @@ class MaxSimSplitter:
         segs: list[torch.Tensor] = []
         prev = 0
         for p in valid_pointers:
-            real_start = (prev + 1) if prev > 0 else 1
-            real_end = p + 1
+            # Base semantics: start after previous boundary (skip CLS), end at p+1 (inclusive).
+            base_start = (prev + 1) if prev > 0 else 1
+            base_end = p + 1
+            # Allow overlap: expand segment window on both sides (except never include CLS at idx 0).
+            real_start = max(1, base_start - overlap_tokens)
+            real_end = min(length, base_end + overlap_tokens)
             if real_end > real_start:
                 segs.append(token_emb[real_start:real_end, :].mean(dim=0))
             prev = p
 
-        tail_start = (prev + 1) if prev > 0 else 1
+        base_tail_start = (prev + 1) if prev > 0 else 1
+        tail_start = max(1, base_tail_start - overlap_tokens)
         if tail_start < length:
             segs.append(token_emb[tail_start:length, :].mean(dim=0))
 
@@ -508,7 +482,7 @@ class MaxSimSplitter:
             actions = torch.as_tensor(actions, device=self.device)
         pointers = actions.tolist()
 
-        sent, full = self._segment_embeds_from_pointers(tok, length, pointers)
+        sent, full = self._segment_embeds_from_pointers(tok, length, pointers, overlap_tokens=self.overlap_tokens)
         return torch.cat([sent, full], dim=0)
 
     def split_text_return_maxsim_tensor(self, text: str):

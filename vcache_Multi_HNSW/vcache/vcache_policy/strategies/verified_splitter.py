@@ -236,35 +236,44 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
     @staticmethod
     def _maxsim_from_tensors(query_tensor, corpus_tensor) -> float:
         """
-        Compute MaxSim similarity in [0, 1] given:
+        Compute symmetric MaxSim similarity in raw cosine space (typically [-1, 1]) given:
           - query_tensor:  [S_q+1, H] (last row is full embed)
           - corpus_tensor: [S_c+1, H] (last row is full embed)
+
+        NOTE: We intentionally treat the full embedding (last row) as an additional "segment"
+        for MaxSim, so it participates in the MaxSim row/col aggregation.
         """
         import torch
         import torch.nn.functional as F
 
         dev = query_tensor.device
-        weights = torch.softmax(torch.tensor([-1e9, 0.0, 0.0], device=dev, dtype=torch.float32), dim=0)
-        w_coarse, w_row, w_col = weights.tolist()
 
         qt = query_tensor.to(dtype=torch.float32)
         ct = corpus_tensor.to(dtype=torch.float32, device=qt.device)
 
-        coarse = F.cosine_similarity(qt[-1:, :], ct[-1:, :]).squeeze()
-        query_sentence = qt[:-1, :]
-        corpus_sentence = ct[:-1, :]
-        if query_sentence.shape[0] > 0 and corpus_sentence.shape[0] > 0:
-            qn = F.normalize(query_sentence, p=2, dim=-1)
-            cn = F.normalize(corpus_sentence, p=2, dim=-1)
+        # MaxSim over *all* rows, including the last "full embedding" row.
+        query_vectors = qt
+        corpus_vectors = ct
+        if query_vectors.shape[0] > 0 and corpus_vectors.shape[0] > 0:
+            qn = F.normalize(query_vectors, p=2, dim=-1)
+            cn = F.normalize(corpus_vectors, p=2, dim=-1)
             cos = torch.mm(qn, cn.T)
-            row_score = torch.max(cos, dim=1).values.mean()
-            col_score = torch.max(cos, dim=0).values.mean()
+            max_cos_sim_row = torch.max(cos, dim=1).values  # [Q]
+            max_cos_sim_col = torch.max(cos, dim=0).values  # [C]
+
+            # Weighted version (training-style). No per-segment weights available here, so use uniform.
+            query_weights = torch.ones(max_cos_sim_row.shape[0], device=dev, dtype=torch.float32)
+            corpus_weights = torch.ones(max_cos_sim_col.shape[0], device=dev, dtype=torch.float32)
+            row_score = torch.sum(max_cos_sim_row * query_weights) / (torch.sum(query_weights) + 1e-8)
+            col_score = torch.sum(max_cos_sim_col * corpus_weights) / (torch.sum(corpus_weights) + 1e-8)
         else:
             row_score = torch.tensor(0.0, device=dev)
             col_score = torch.tensor(0.0, device=dev)
 
-        raw = (w_coarse * coarse) + (w_row * row_score) + (w_col * col_score)
-        return float(torch.clamp((raw + 1.0) / 2.0, 0.0, 1.0).item())
+        # Weighted mix between row/col (uniform by default).
+        mix = torch.softmax(torch.tensor([0.0, 0.0], device=dev, dtype=torch.float32), dim=0)
+        raw = mix[0] * row_score + mix[1] * col_score
+        return float(raw.item())
 
     def _maybe_cache_candidate_segments(self, embedding_id: int) -> None:
         """

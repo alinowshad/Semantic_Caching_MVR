@@ -106,6 +106,12 @@ class MaxSimEnv(RL4COEnvBase):
         """
         初始化环境。
         """
+        # Whether to append a full pooled embedding as an extra "segment" row when scoring MaxSim.
+        # Default True preserves the current behavior.
+        self.include_full_embedding = bool(kwargs.pop("include_full_embedding", True))
+        # Whether to additionally mix in cosine(full_embed_a, full_embed_b) with MaxSim when computing
+        # the similarity used for reward/loss.
+        self.use_fullcos_mix = bool(kwargs.pop("use_fullcos_mix", True))
         super().__init__(check_solution=False, **kwargs) 
         
         self.generator = generator
@@ -360,18 +366,21 @@ class MaxSimEnv(RL4COEnvBase):
         """
         Compute weighted symmetric MaxSim score in raw cosine space (typically [-1, 1]).
 
-        Changes vs the previous implementation:
-        - Remove the separate coarse-grained full-vector cosine term.
-        - Include the full pooled vector (last row) as an additional "segment" that participates
-          in the MaxSim row/col aggregation.
+        Notes:
+        - This function is agnostic to whether a "full embedding" row is included.
+          If the caller appends a full pooled vector as an extra row, it will participate
+          in the MaxSim aggregation (as just another row).
         """
        
+        # IMPORTANT: ensure weights are on the same device as the tensors being scored.
+        # (Lightning/RL4CO can move env/policy to different CUDA devices; using self.device here
+        # can cause cuda:0 vs cuda:N mismatches.)
+        dev = query_tensor.device
         # Keep score_weights_raw shape unchanged for compatibility, but only use fine weights.
-        fine_mix = F.softmax(self.score_weights_raw[1:], dim=0)  # [row, col]
+        fine_mix = F.softmax(self.score_weights_raw[1:].to(dev), dim=0)  # [row, col]
         w_fine_row = fine_mix[0]
         w_fine_col = fine_mix[1]
 
-        # Include the full pooled vector (last row) as an additional segment for MaxSim.
         query_vecs = query_tensor
         corpus_vecs = sub_corpus_embeddings
 
@@ -408,12 +417,17 @@ class MaxSimEnv(RL4COEnvBase):
             max_cos_sim_col = torch.max(cos_sim_matrix, dim=0).values  # [C]
             fine_grained_col_score = torch.sum(max_cos_sim_col * corpus_weights) / (torch.sum(corpus_weights) + 1e-8)
         else:
-            fine_grained_row_score = torch.tensor(0.0, device=self.device)
-            fine_grained_col_score = torch.tensor(0.0, device=self.device)
+            fine_grained_row_score = torch.tensor(0.0, device=dev)
+            fine_grained_col_score = torch.tensor(0.0, device=dev)
 
         final_score = (w_fine_row * fine_grained_row_score + w_fine_col * fine_grained_col_score)
 
         return final_score
+
+    @staticmethod
+    def _cos_to_unit_interval(x: torch.Tensor) -> torch.Tensor:
+        """Map cosine-like similarity from [-1, 1] to [0, 1] with clamping."""
+        return ((x + 1.0) * 0.5).clamp(0.0, 1.0)
 
     def _get_reward(self, td: TensorDict, actions) -> torch.Tensor:
         batch_size = actions.shape[0]
@@ -585,25 +599,46 @@ class MaxSimEnv(RL4COEnvBase):
                     continue
                 sentence_embeds_b = torch.stack(seg_emb_b_list, dim=0)
 
-                full_embed_a = token_emb_a.mean(dim=0, keepdim=True)
-                full_embed_b = token_emb_b.mean(dim=0, keepdim=True)
-
-                if sentence_embeds_a.shape[0] > 0:
-                    query_tensor = torch.cat([sentence_embeds_a, full_embed_a], dim=0)
+                # Full pooled embedding: mean over tokens excluding CLS (index 0), consistent with segment pooling.
+                if int(la) > 1:
+                    full_embed_a = token_emb_a[1:la].mean(dim=0, keepdim=True)
                 else:
-                    query_tensor = full_embed_a
+                    full_embed_a = token_emb_a.mean(dim=0, keepdim=True)
+                if int(lb) > 1:
+                    full_embed_b = token_emb_b[1:lb].mean(dim=0, keepdim=True)
+                else:
+                    full_embed_b = token_emb_b.mean(dim=0, keepdim=True)
 
-                if sentence_embeds_b.shape[0] > 0:
+                if self.include_full_embedding:
+                    query_tensor = torch.cat([sentence_embeds_a, full_embed_a], dim=0)
                     corpus_tensor = torch.cat([sentence_embeds_b, full_embed_b], dim=0)
                 else:
-                    corpus_tensor = full_embed_b
+                    # Segment-only mode: do not append the full pooled embedding row.
+                    query_tensor = sentence_embeds_a
+                    corpus_tensor = sentence_embeds_b
 
                 query_weights = torch.ones(sentence_embeds_a.shape[0], device=query_tensor.device)
                 corpus_weights = torch.ones(sentence_embeds_b.shape[0], device=corpus_tensor.device)
 
-                rewards[i] = self.raw_score_text(
+                maxsim_score = self.raw_score_text(
                     query_tensor, corpus_tensor, query_weights, corpus_weights, times=0
-                ).to(rewards.device)
+                )
+
+                if self.use_fullcos_mix:
+                    # Cosine between the full pooled embeddings (single vectors).
+                    # NOTE: This cosine is in raw cosine space [-1, 1], same scale as raw_score_text.
+                    full_cos = F.cosine_similarity(
+                        F.normalize(full_embed_a.to(query_tensor.device), p=2, dim=-1),
+                        F.normalize(full_embed_b.to(query_tensor.device), p=2, dim=-1),
+                        dim=-1,
+                    ).mean()
+                    # Simple average (no alpha): requested behavior.
+                    final_score = 0.5 * (maxsim_score + full_cos)
+                else:
+                    final_score = maxsim_score
+
+                # Ensure final similarity used as reward is in [0, 1].
+                rewards[i] = self._cos_to_unit_interval(final_score).to(rewards.device)
 
         return rewards
 

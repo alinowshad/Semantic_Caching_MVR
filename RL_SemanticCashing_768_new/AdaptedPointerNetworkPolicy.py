@@ -64,14 +64,26 @@ class AdaptedPointerNetworkPolicy(nn.Module):
                  policy_mode: str = "joint",
                  split_on_space: bool = False,
                  split_words_before: bool = False,
+                 split_on_connectors: bool = True,
                 ):
         super().__init__()
-        self.env = env
+        # IMPORTANT:
+        # Do NOT store the full env on the policy instance.
+        #
+        # RL4CO's WarmupBaseline does `copy.deepcopy(policy)` during setup. Our `env` holds
+        # `env.generator`, which may contain a very large CUDA token-embedding cache when
+        # `--precompute_token_embeddings` is enabled (e.g., ~7.3GB for 10k x 512 x 768 fp16).
+        # Keeping a strong reference here makes deepcopy try to clone those cached CUDA tensors
+        # and can immediately OOM before training starts.
+        #
+        # RL4CO passes `env` explicitly to `forward(td, env=...)`, so retaining it is unnecessary.
+        self.env = None
         self.hidden_dim = hidden_dim
         self.max_segments = max_segments
         self.policy_mode = str(policy_mode).lower().strip()
         self.split_on_space = bool(split_on_space)
         self.split_words_before = bool(split_words_before)
+        self.split_on_connectors = bool(split_on_connectors)
         if self.policy_mode not in {"joint", "separate"}:
             raise ValueError(f"Unsupported policy_mode={policy_mode!r}. Use 'joint' or 'separate'.")
       
@@ -179,6 +191,9 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             "likewise",
             "similarly",
         ]
+        if not self.split_on_connectors:
+            # Punctuation-only mode: do not allow connector words to be split markers.
+            self.split_words = []
 
         self._special_token_ids = None
         self._special_token_ids_tensor = {}
@@ -411,10 +426,11 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         is_punct_global = self._compute_split_candidate_mask(input_ids)
 
         # Decoder init
-        decoder_input = self.decoder_start_input.unsqueeze(0).repeat(batch_size, 1)
-        h = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device)
-        c = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device)
-        current_b = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        dev = encoder_outputs.device
+        decoder_input = self.decoder_start_input.unsqueeze(0).repeat(batch_size, 1).to(dev)
+        h = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=dev)
+        c = torch.zeros(batch_size, self.decoder_cell.hidden_size, device=dev)
+        current_b = torch.zeros(batch_size, dtype=torch.long, device=dev)
 
         pointers_steps = []
         logp_steps = []
@@ -424,14 +440,14 @@ class AdaptedPointerNetworkPolicy(nn.Module):
 
         # Precompute ctx [B, H, L] for efficiency inside the loop
         ctx = self.attention_linear_encoder(encoder_outputs.permute(0, 2, 1))
-        V_exp = self.V.unsqueeze(0).expand(batch_size, -1).unsqueeze(1)
+        V_exp = self.V.unsqueeze(0).expand(batch_size, -1).unsqueeze(1).to(dev)
         mask_fill_val = float("-inf")
 
         for step in range(self.max_segments):
             h, c = self.decoder_cell(decoder_input, (h, c))
             query_vec = self.attention_linear_decoder(h)
 
-            rng = torch.arange(seq_len, device=self.device).expand(batch_size, -1)
+            rng = torch.arange(seq_len, device=dev).expand(batch_size, -1)
             is_future = rng > current_b.unsqueeze(1)
             is_in_len = rng < (eff_len - 1).unsqueeze(1)
             valid_slots = is_punct_global & is_future & is_in_len
@@ -444,8 +460,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             attn_scores = torch.bmm(V_exp, torch.tanh(inp + ctx)).squeeze(1)  # [B, L]
             attn_scores = attn_scores.masked_fill(mask_ptr, mask_fill_val)
 
-            pointer = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-            logp = torch.zeros(batch_size, device=self.device)
+            pointer = torch.zeros(batch_size, dtype=torch.long, device=dev)
+            logp = torch.zeros(batch_size, device=dev)
 
             has_valid = valid_slots.any(dim=1)
             if has_valid.any():
@@ -495,7 +511,7 @@ class AdaptedPointerNetworkPolicy(nn.Module):
                     )
 
             # Segment pooling for feedback (uses encoder_outputs, already in hidden_dim)
-            feedback = torch.zeros(batch_size, self.hidden_dim, device=self.device)
+            feedback = torch.zeros(batch_size, self.hidden_dim, device=dev)
             for b in range(batch_size):
                 s = int(current_b[b].item())
                 e = int(pointer[b].item())
@@ -545,9 +561,10 @@ class AdaptedPointerNetworkPolicy(nn.Module):
 
         actions, log_likelihood, info = self._forward(td, decode_type=decode_type, **kwargs)
         # 计算奖励
-        used_env = env if env is not None else getattr(self, 'env', None)
+        # We intentionally do not fall back to a stored env (see __init__ note). Callers must pass it.
+        used_env = env
         if used_env is None:
-            raise RuntimeError("Environment instance is required to compute reward.")
+            raise RuntimeError("Environment instance is required; call forward(..., env=your_env).")
         reward = used_env.get_reward(td, actions)
 
         return {
@@ -809,9 +826,10 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         encoder_outputs_b = embedded_b
         
         # --- 3. Decoder 初始化 ---
-        decoder_input = self.decoder_start_input.unsqueeze(0).repeat(batch_size, 1)
-        h, c = (torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device),
-                torch.zeros(batch_size, self.decoder_cell.hidden_size, device=self.device))
+        dev = self.device
+        decoder_input = self.decoder_start_input.unsqueeze(0).repeat(batch_size, 1).to(dev)
+        h, c = (torch.zeros(batch_size, self.decoder_cell.hidden_size, device=dev),
+                torch.zeros(batch_size, self.decoder_cell.hidden_size, device=dev))
         
         pointers = []
         log_probs = []
@@ -822,8 +840,8 @@ class AdaptedPointerNetworkPolicy(nn.Module):
         had_any_valid_b_steps = []
         
         # 初始边界设为 0 (对应 [CLS])
-        current_bA = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        current_bB = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        current_bA = torch.zeros(batch_size, dtype=torch.long, device=dev)
+        current_bB = torch.zeros(batch_size, dtype=torch.long, device=dev)
 
         # 预计算全局标点 Mask [batch, seq_len]
     
@@ -841,7 +859,7 @@ class AdaptedPointerNetworkPolicy(nn.Module):
             query_vec = self.attention_linear_decoder(h)
 
             #  指针 A 选择
-            range_a = torch.arange(seq_len_a, device=self.device).expand(batch_size, -1)
+            range_a = torch.arange(seq_len_a, device=dev).expand(batch_size, -1)
             
             # 1. 必须是标点符号 (预计算结果)
             # 2. 必须严格在当前边界之后 (range_a > current_bA)
@@ -859,15 +877,15 @@ class AdaptedPointerNetworkPolicy(nn.Module):
 
             inp_a = query_vec.unsqueeze(2)
             ctx_a = self.attention_linear_encoder(encoder_outputs_a.permute(0, 2, 1))
-            V_exp = self.V.unsqueeze(0).expand(batch_size, -1).unsqueeze(1)
+            V_exp = self.V.unsqueeze(0).expand(batch_size, -1).unsqueeze(1).to(dev)
             attn_scores_a = torch.bmm(V_exp, torch.tanh(inp_a + ctx_a)).squeeze(1)
             
-       
+            # ...
             mask_fill_val = float('-inf') 
             attn_scores_a = attn_scores_a.masked_fill(mask_ptr_a, mask_fill_val)
 
             # === 指针 B 选择 ===
-            range_b = torch.arange(seq_len_b, device=self.device).expand(batch_size, -1)
+            range_b = torch.arange(seq_len_b, device=dev).expand(batch_size, -1)
             
             is_future_b = range_b > current_bB.unsqueeze(1)
             is_in_length_b = range_b < (eff_len_b - 1).unsqueeze(1)
@@ -937,11 +955,11 @@ class AdaptedPointerNetworkPolicy(nn.Module):
                     debug_records.append(rec)
 
             # === 采样/Argmax ===
-            pointer_a = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-            pointer_b = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-            logp_a = torch.zeros(batch_size, device=self.device)
-            logp_b = torch.zeros(batch_size, device=self.device)
-
+            pointer_a = torch.zeros(batch_size, dtype=torch.long, device=dev)
+            pointer_b = torch.zeros(batch_size, dtype=torch.long, device=dev)
+            logp_a = torch.zeros(batch_size, device=dev)
+            logp_b = torch.zeros(batch_size, device=dev)
+            
             has_valid_a = valid_slots_a.any(dim=1)
             has_valid_b = valid_slots_b.any(dim=1)
 

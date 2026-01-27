@@ -85,6 +85,9 @@ def _get_id_set(row: Dict[str, Any]) -> int:
     v = row.get("id_set", -1)
     if v == -1:
         v = row.get("ID_Set", -1)
+    # Fallback for custom datasets: allow using `label_id` as the benchmark id_set label.
+    if v == -1:
+        v = row.get("label_id", -1)
     try:
         return int(v)
     except Exception:
@@ -144,7 +147,13 @@ def main() -> None:
         help="Embedding column (optional, no longer used for embeddings as BGE is live).",
     )
     parser.add_argument(
-        "--llm-col", required=True, help="LLM response column, e.g. response_llama_3_8b"
+        "--llm-col",
+        required=False,
+        default=None,
+        help=(
+            "LLM response column, e.g. response_llama_3_8b. "
+            "Optional when --similarity-evaluator=benchmark_id_set (label-only evaluation)."
+        ),
     )
     parser.add_argument(
         "--max-samples",
@@ -221,10 +230,6 @@ def main() -> None:
             raise ValueError(
                 f"Local dataset is missing required column 'prompt'. Available columns: {list(df.columns)}"
             )
-        if args.llm_col not in df.columns:
-            raise ValueError(
-                f"Local dataset is missing required LLM response column '{args.llm_col}'. Available columns: {list(df.columns)}"
-            )
 
         # If user asked for benchmark_id_set but the file doesn't have usable ids, fall back to string.
         id_col = None
@@ -232,6 +237,8 @@ def main() -> None:
             id_col = "ID_Set"
         elif "id_set" in df.columns:
             id_col = "id_set"
+        elif "label_id" in df.columns:
+            id_col = "label_id"
         if args.similarity_evaluator == "benchmark_id_set":
             has_usable_ids = False
             if id_col is not None:
@@ -242,6 +249,17 @@ def main() -> None:
                     has_usable_ids = False
             if not has_usable_ids:
                 args.similarity_evaluator = "string"
+        # If we fell back to string evaluation, we MUST have a response column.
+        if args.similarity_evaluator == "string":
+            if args.llm_col is None or str(args.llm_col) == "":
+                raise ValueError(
+                    "similarity-evaluator='string' requires --llm-col, but none was provided. "
+                    f"Available columns: {list(df.columns)}"
+                )
+            if args.llm_col not in df.columns:
+                raise ValueError(
+                    f"Local dataset is missing required LLM response column '{args.llm_col}'. Available columns: {list(df.columns)}"
+                )
 
         rows = df.to_dict("records")
         if args.max_samples is not None:
@@ -303,16 +321,24 @@ def main() -> None:
         hit_samples_f = open(hit_samples_path, "w", encoding="utf-8")
 
     t0 = time.time()
-    pbar = tqdm(rows, desc="Evaluating", unit="samples")
+    desc_base = "Evaluating"
+    pbar = tqdm(rows, desc=desc_base, unit="samples")
     try:
         for r in pbar:
             prompt = r["prompt"]
             system_prompt = r.get("output_format", "") or ""
             id_set = _get_id_set(r)
 
-            label_response = r[args.llm_col]
+            # Only require/consume response strings when using string-based correctness.
+            if args.similarity_evaluator == "string":
+                label_response = r[args.llm_col]
+            else:
+                # ID-based evaluation: we don't need response strings.
+                label_response = ""
 
-            # Inject ground truth response for the benchmark engine
+            # Inject ground truth response for the benchmark engine.
+            # NOTE: BenchmarkInferenceEngine expects `set_next_response()` to be called to set the attribute.
+            # For ID-based evaluation, an empty string is fine (we don't judge string correctness).
             inference_engine.set_next_response(label_response)
 
             is_hit, resp, resp_meta, nn_meta = vcache.infer_with_cache_info(
@@ -323,6 +349,11 @@ def main() -> None:
 
             n += 1
             hits += int(is_hit)
+            # Put hit stats in the *description* so it doesn't get truncated off the right side.
+            try:
+                pbar.set_description(f"{desc_base} hits={hits}/{n} ({(hits/n):.1%})")
+            except Exception:
+                pass
             d_tp, d_fp, d_tn, d_fn = _score_step(
                 is_cache_hit=is_hit,
                 label_id_set=id_set,
@@ -357,26 +388,22 @@ def main() -> None:
                 hit_samples_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
             # Track per-sample result
-            per_sample_results.append({
-                "sample_index": n,
-                "is_hit": is_hit,
-                "running_hit_rate": hits / n,
-                "tp": d_tp,
-                "fp": d_fp,
-                "tn": d_tn,
-                "fn": d_fn
-            })
+            per_sample_results.append(
+                {
+                    "sample_index": n,
+                    "is_hit": is_hit,
+                    "running_hit_rate": hits / n,
+                    "tp": d_tp,
+                    "fp": d_fp,
+                    "tn": d_tn,
+                    "fn": d_fn,
+                }
+            )
 
-            # Update progress bar stats
-            pbar.set_postfix({
-                "hits": f"{hits}/{n}",
-                "hit_rate": f"{(hits/n):.1%}"
-            })
-
-            # VerifiedDecisionPolicy updates cache metadata asynchronously; a tiny sleep (as in benchmark.py)
-            # prevents the evaluation loop from outrunning the background worker and biasing toward EXPLORE.
-            if args.sleep and args.sleep > 0:
-                time.sleep(float(args.sleep))
+        # VerifiedDecisionPolicy updates cache metadata asynchronously; a tiny sleep (as in benchmark.py)
+        # prevents the evaluation loop from outrunning the background worker and biasing toward EXPLORE.
+        if args.sleep and args.sleep > 0:
+            time.sleep(float(args.sleep))
     finally:
         if hit_samples_f is not None:
             try:

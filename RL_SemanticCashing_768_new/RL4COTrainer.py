@@ -69,6 +69,15 @@ class ResumeFriendlyREINFORCE(REINFORCE):
 
 
     def __init__(self, *args, **kwargs):
+        # What scalar reward REINFORCE optimizes:
+        # - cal_only: reward = -BCE (loss-only reward; requires labels)
+        # - signed_maxsim: reward = (+1 for correct, -1 for incorrect) * MaxSim
+        # - signed_maxsim_plus_cal: reward = signed_maxsim + alpha * (-BCE)
+        self.reward_mode = str(kwargs.pop("reward_mode", "cal_only")).lower().strip()
+        if self.reward_mode not in {"cal_only", "signed_maxsim", "signed_maxsim_plus_cal"}:
+            raise ValueError(
+                f"Unsupported reward_mode={self.reward_mode!r}. Use cal_only|signed_maxsim|signed_maxsim_plus_cal."
+            )
         self.alpha_cal_reward = kwargs.pop("alpha_cal_reward", 0.1)
         self.beta_cal_loss = kwargs.pop("beta_cal_loss", 1.0)
         # Class weights for BCE (to mitigate imbalance). These scale the per-example BCE.
@@ -81,9 +90,9 @@ class ResumeFriendlyREINFORCE(REINFORCE):
 
         super().__init__(*args, **kwargs)
 
-        # If we use *raw* similarity rewards (e.g., cosine-like in [-1, 1]) for calibration,
-        # a natural initial threshold is ~0.0 (not 0.5 which assumes [0,1] scaling).
-        self.calibrator = SigmoidCalibrator(init_t=0.0, init_gamma=10.0)
+        # Similarity is normalized to [0, 1] (see MaxSimEnv reward mapping), so a natural
+        # initial threshold is ~0.5.
+        self.calibrator = SigmoidCalibrator(init_t=0.5, init_gamma=10.0)
 
 
     def on_load_checkpoint(self, checkpoint):
@@ -104,16 +113,18 @@ class ResumeFriendlyREINFORCE(REINFORCE):
         """
         super().setup(stage)
 
-        # Get the device from the policy (Lightning should have moved it to GPU by now)
-        try:
-            policy_device = next(self.policy.parameters()).device
-            print(f"[DEVICE] Policy device: {policy_device}")
-        except StopIteration:
-            # Fallback to CUDA if available
-            policy_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            print(f"[DEVICE] Policy has no parameters, using fallback device: {policy_device}")
+        # Prefer the LightningModule device (what the Trainer actually uses).
+        # Relying on policy.parameters().device can be misleading early in setup and can cause us to
+        # accidentally move heavy submodules back to CPU (hurting speed).
+        policy_device = getattr(self, "device", None)
+        if policy_device is None:
+            try:
+                policy_device = next(self.policy.parameters()).device
+            except StopIteration:
+                policy_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[DEVICE] Module device: {policy_device}")
 
-        # Move generator's embedding model to GPU after Lightning moves the model
+        # Move generator's embedding model to match the module device
         if hasattr(self, 'env') and hasattr(self.env, 'generator'):
             generator = self.env.generator
             if hasattr(generator, 'embedding_model') and generator.embedding_model is not None:
@@ -182,8 +193,25 @@ class ResumeFriendlyREINFORCE(REINFORCE):
             bce_per = F.binary_cross_entropy_with_logits(logits, c, weight=w, reduction="none")  # [B]
             r_cal = (-bce_per).detach()
 
-        alpha = float(getattr(self, "alpha_cal_reward", 0.5))
-        shaped_reward_flat = sim_for_cal + alpha * r_cal
+        mode = str(getattr(self, "reward_mode", "cal_only")).lower().strip()
+        # signed similarity: +sim for positives, -sim for negatives
+        signed_sim = sim_for_cal
+        if hasattr(td, "keys") and ("correct" in td.keys()):
+            c01 = td["correct"].float().view(-1).to(sim_for_cal.device)  # [B]
+            sign = (2.0 * (c01 >= 0.5).float() - 1.0)  # {+1,-1}
+            signed_sim = sim_for_cal * sign
+
+        if mode == "signed_maxsim":
+            shaped_reward_flat = signed_sim
+        elif mode == "signed_maxsim_plus_cal":
+            alpha = float(getattr(self, "alpha_cal_reward", 0.5))
+            shaped_reward_flat = signed_sim + alpha * r_cal
+        else:
+            # cal_only: if labels are missing, fall back to base similarity for logging
+            if hasattr(td, "keys") and ("correct" in td.keys()):
+                shaped_reward_flat = r_cal
+            else:
+                shaped_reward_flat = sim_for_cal
         return shaped_reward_flat.reshape_as(base_reward_raw)
 
     def shared_step(self, batch, batch_idx: int, phase: str, dataloader_idx: int = None):
@@ -351,17 +379,32 @@ class ResumeFriendlyREINFORCE(REINFORCE):
         # Use the same similarity s that the calibrator sees (probability-friendly),
         # and add the detached log-likelihood shaping term.
         # -----------------------------
-        # Paper objective: Reward = SMaxSim - λ * BCE
-        # Here: r_cal = -BCE, so we add λ * r_cal.
-        alpha = float(getattr(self, "alpha_cal_reward", 0.5))
-        shaped_reward_flat = sim_for_cal + alpha * r_cal
+        mode = str(getattr(self, "reward_mode", "cal_only")).lower().strip()
+        # signed similarity: +sim for positives, -sim for negatives
+        signed_sim = sim_for_cal
+        if hasattr(td, "keys") and ("correct" in td.keys()):
+            c01 = td["correct"].float().view(-1).to(sim_for_cal.device)  # [B]
+            sign = (2.0 * (c01 >= 0.5).float() - 1.0)  # {+1,-1}
+            signed_sim = sim_for_cal * sign
+
+        if mode == "signed_maxsim":
+            shaped_reward_flat = signed_sim
+        elif mode == "signed_maxsim_plus_cal":
+            alpha = float(getattr(self, "alpha_cal_reward", 0.5))
+            shaped_reward_flat = signed_sim + alpha * r_cal
+        else:
+            # cal_only: if labels are missing, fall back to base similarity
+            if hasattr(td, "keys") and ("correct" in td.keys()):
+                shaped_reward_flat = r_cal
+            else:
+                shaped_reward_flat = sim_for_cal
         shaped_reward = shaped_reward_flat.reshape_as(base_reward_raw)
 
         # Optional: surface key signals directly on the progress bar line.
         # Keep these short so the bar stays readable.
         try:
             self.log("reward_base", sim_for_cal.detach().mean(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
-            self.log("reward_bce", (torch.tensor(alpha, device=sim_for_cal.device) * r_cal.detach()).mean(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+            self.log("reward_cal", r_cal.detach().mean(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
             self.log("reward_shaped", shaped_reward_flat.detach().mean(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
             if hasattr(td, "keys") and ("correct" in td.keys()):
                 c_dbg = td["correct"].float().view(-1).to(sim_for_cal.device)
@@ -447,9 +490,8 @@ class ResumeFriendlyREINFORCE(REINFORCE):
             dbg["train/gamma_hat"] = torch.exp(self.calibrator.log_gamma.detach())
             # reward breakdown
             dbg["train/reward_base_mean"] = sim_for_cal.detach().mean()
-            dbg["train/reward_bce_term_mean"] = (torch.tensor(alpha, device=sim_for_cal.device) * r_cal.detach()).mean()
+            dbg["train/reward_cal_mean"] = r_cal.detach().mean()
             dbg["train/reward_shaped_mean"] = shaped_reward_flat.detach().mean()
-            dbg["train/reward_lambda"] = torch.tensor(alpha, device=sim_for_cal.device)
 
             self.log_dict(dbg, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         except Exception:
@@ -785,20 +827,21 @@ if __name__ == '__main__':
     parser.add_argument(
         "--nn_similarity_mode",
         type=str,
-        default="blockwise",
+        default="full",
         choices=["blockwise", "full"],
         help="How to compute embedding cosine NN for anchor_nn: 'blockwise' (low RAM) or 'full' (build full NxN matrix in RAM).",
     )
     parser.add_argument(
         "--nn_similarity_dtype",
         type=str,
-        default="float16",
+        default="float32",
         choices=["float16", "float32"],
         help="Dtype for the full NxN similarity matrix when --nn_similarity_mode=full.",
     )
     parser.add_argument(
         "--nn_full_pairwise",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="If set, MaxSim NN rebuild considers all prompt pairs (O(N^2), can be very slow). Otherwise uses top-k candidates by embedding similarity.",
     )
     parser.add_argument(
@@ -809,14 +852,44 @@ if __name__ == '__main__':
         help="What to do when a sampled (x,y) pair has no label in the pairs JSON: 'skip' drops it (recommended), 'zero' sets correct=0.",
     )
     parser.add_argument(
+        "--precompute_token_embeddings",
+        action="store_true",
+        help=(
+            "If set, precompute and cache token-level embeddings (last_hidden_state, input_ids, attention_mask) "
+            "for the full dataset in CPU RAM at startup. This avoids running the LM inside the generator for every batch "
+            "and can greatly speed up training, at the cost of RAM."
+        ),
+    )
+    parser.add_argument(
         "--split_on_space",
         action="store_true",
+        default=False,
         help="If set, treat whitespace/word-boundary tokens as additional split delimiters (in addition to punctuation/connector words).",
     )
     parser.add_argument(
         "--split_words_before",
         action="store_true",
+        default=False,
         help="If set, treat connector-word split markers as boundaries *before* the word (so the connector joins the following segment).",
+    )
+    parser.add_argument(
+        "--punctuation_only",
+        action="store_true",
+        help="If set, ONLY allow punctuation tokens as valid split points (disables connector-word and whitespace splits).",
+    )
+    parser.add_argument(
+        "--no_full_embedding",
+        action="store_true",
+        help="If set, do NOT append the full pooled embedding as an extra segment row during MaxSim scoring (segment-only mode).",
+    )
+    parser.add_argument(
+        "--no_fullcos_mix",
+        action="store_true",
+        help=(
+            "If set, do NOT mix in full-embedding cosine similarity. "
+            "By default, the similarity used for reward/loss is the SIMPLE AVERAGE of: "
+            "(1) MaxSim over segments (and optional full row) and (2) cosine(full_embed_a, full_embed_b)."
+        ),
     )
     parser.add_argument(
         "--gpu_id",
@@ -866,48 +939,26 @@ if __name__ == '__main__':
         action="store_true",
         help="If set, automatically apply per-batch class-balancing weights for BCE based on the observed pos/neg counts in the batch.",
     )
+    parser.add_argument(
+        "--reward_mode",
+        type=str,
+        default="cal_only",
+        choices=["cal_only", "signed_maxsim", "signed_maxsim_plus_cal"],
+        help="What scalar reward REINFORCE optimizes. "
+             "'cal_only' uses reward=-BCE (loss-only reward; requires labels); "
+             "'signed_maxsim' uses (+1 for correct, -1 for incorrect)*MaxSim; "
+             "'signed_maxsim_plus_cal' uses signed_maxsim + alpha*(-BCE).",
+    )
     args = parser.parse_args()
-    print(f"[ARGS] train_file={args.train_file}")
-    print(f"[ARGS] train_parquet={args.train_parquet}")
-    print(f"[ARGS] train_pairs_json={args.train_pairs_json}")
-    print(f"[ARGS] val_file={args.val_file}")
-    print(f"[ARGS] val_parquet={args.val_parquet}")
-    print(f"[ARGS] val_pairs_json={args.val_pairs_json}")
-    print(f"[ARGS] test_file={args.test_file}")
-    print(f"[ARGS] test_parquet={args.test_parquet}")
-    print(f"[ARGS] test_pairs_json={args.test_pairs_json}")
-    print(f"[ARGS] checkpoint_dir={args.checkpoint_dir}")
-    print(f"[ARGS] resume_from_checkpoint={args.resume_from_checkpoint}")
-    print(f"[ARGS] log_dir={args.log_dir}")
-    print(f"[ARGS] debug_policy={args.debug_policy}")
-    print(f"[ARGS] debug_policy_log_path={args.debug_policy_log_path}")
-    print(f"[ARGS] debug_policy_every_n_epochs={args.debug_policy_every_n_epochs}")
-    print(f"[ARGS] policy_mode={args.policy_mode}")
-    print(f"[ARGS] train_sampling_mode={args.train_sampling_mode}")
-    print(f"[ARGS] nn_warmup_epochs={args.nn_warmup_epochs}")
-    print(f"[ARGS] nn_candidate_topk={args.nn_candidate_topk}")
-    print(f"[ARGS] nn_rebuild_every_n_epochs={args.nn_rebuild_every_n_epochs}")
-    print(f"[ARGS] nn_full_pairwise={args.nn_full_pairwise}")
-    print(f"[ARGS] nn_similarity_mode={args.nn_similarity_mode}")
-    print(f"[ARGS] nn_similarity_dtype={args.nn_similarity_dtype}")
-    print(f"[ARGS] nn_label_strategy={args.nn_label_strategy}")
-    print(f"[ARGS] split_on_space={args.split_on_space}")
-    print(f"[ARGS] split_words_before={args.split_words_before}")
-    print(f"[ARGS] gpu_id={args.gpu_id}")
-    print(f"[ARGS] batch_size={args.batch_size}")
-    print(f"[ARGS] lr={args.lr}")
-    print(f"[ARGS] max_epochs={args.max_epochs}")
-    print(f"[ARGS] accumulate_grad_batches={args.accumulate_grad_batches}")
-    print(f"[ARGS] check_val_every_n_epoch={args.check_val_every_n_epoch}")
-    print(f"[ARGS] train_data_size={args.train_data_size}")
-    print(f"[ARGS] seed={args.seed}")
-    print(f"[ARGS] bce_pos_weight={args.bce_pos_weight}")
-    print(f"[ARGS] bce_neg_weight={args.bce_neg_weight}")
-    print(f"[ARGS] bce_auto_balance={args.bce_auto_balance}")
-    print(f"[ARGS] parquet_text_column={args.parquet_text_column}")
-    print(f"[ARGS] return_row_indices={args.return_row_indices}")
-    print(f"[ARGS] label_mode={args.label_mode}")
-    print(f"[ARGS] response_column={args.response_column}")
+
+    # Print ALL parsed arguments in a stable order (so new flags automatically show up).
+    try:
+        _args_dict = vars(args)
+        for _k in sorted(_args_dict.keys()):
+            print(f"[ARGS] {_k}={_args_dict[_k]}")
+    except Exception:
+        # Fallback: don't crash training if something odd happens with argparse
+        print(f"[ARGS] {args}")
     
     # Verify HF_ENDPOINT is set correctly
     hf_endpoint = os.environ.get('HF_ENDPOINT', 'Not set')
@@ -1005,8 +1056,16 @@ if __name__ == '__main__':
         nn_similarity_dtype=str(args.nn_similarity_dtype),
         nn_rebuild_every_n_epochs=int(args.nn_rebuild_every_n_epochs),
         nn_label_strategy=str(args.nn_label_strategy),
+        precompute_token_embeddings=bool(args.precompute_token_embeddings),
     )
-    train_env = MaxSimEnv(generator=train_generator, max_segments=MAX_SEGMENTS, embedding_model=embedding_model, device=device)
+    train_env = MaxSimEnv(
+        generator=train_generator,
+        max_segments=MAX_SEGMENTS,
+        embedding_model=embedding_model,
+        device=device,
+        include_full_embedding=(not bool(args.no_full_embedding)),
+        use_fullcos_mix=(not bool(args.no_fullcos_mix)),
+    )
 
     val_generator = MaxSimGenerator(
         prompts=val_prompts,
@@ -1020,8 +1079,16 @@ if __name__ == '__main__':
         max_len=MAX_LEN,
         embedding_model=embedding_model,
         seed=(None if base_seed is None else base_seed + 1),
+        precompute_token_embeddings=bool(args.precompute_token_embeddings),
     )
-    val_env = MaxSimEnv(generator=val_generator, max_segments=MAX_SEGMENTS, embedding_model=embedding_model, device=device)
+    val_env = MaxSimEnv(
+        generator=val_generator,
+        max_segments=MAX_SEGMENTS,
+        embedding_model=embedding_model,
+        device=device,
+        include_full_embedding=(not bool(args.no_full_embedding)),
+        use_fullcos_mix=(not bool(args.no_fullcos_mix)),
+    )
     # IMPORTANT: defer creating the test generator/env until AFTER training (or skip entirely).
     # Creating it here can load the test dataset early and cause a big memory spike at "Starting training...".
     test_env = None
@@ -1033,8 +1100,9 @@ if __name__ == '__main__':
         hidden_dim=768,
         max_segments=MAX_SEGMENTS,
         policy_mode=str(args.policy_mode),
-        split_on_space=bool(args.split_on_space),
-        split_words_before=bool(args.split_words_before),
+        split_on_space=(False if bool(args.punctuation_only) else bool(args.split_on_space)),
+        split_words_before=(False if bool(args.punctuation_only) else bool(args.split_words_before)),
+        split_on_connectors=(False if bool(args.punctuation_only) else True),
     )
     print("Components instantiated.")
 
@@ -1053,6 +1121,7 @@ if __name__ == '__main__':
         'bce_pos_weight': float(args.bce_pos_weight),
         'bce_neg_weight': float(args.bce_neg_weight),
         'bce_auto_balance': bool(args.bce_auto_balance),
+        'reward_mode': str(args.reward_mode),
       
     }
   
@@ -1094,12 +1163,25 @@ if __name__ == '__main__':
     if _ddp_find_unused is None:
         _ddp_find_unused = bool(torch.cuda.is_available() and _n_devices > 1)
 
+    # Lightning GPU selection:
+    # - If using a single GPU, pass the specific device index so we don't accidentally run on CPU
+    #   or on an unintended GPU (and so our precomputed caching behavior matches the policy device).
+    # - If using DDP, Lightning expects an int count.
+    _trainer_devices = None
+    if torch.cuda.is_available():
+        if _n_devices == 1:
+            _trainer_devices = [GPU_ID]
+        else:
+            _trainer_devices = _n_devices
+    else:
+        _trainer_devices = 1
+
     trainer = RL4COTrainer(
         max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         # Multi-GPU: set --devices > 1 (Lightning will launch DDP).
         # If using torchrun, pass --devices=1 and rely on LOCAL_RANK in each process.
-        devices=_n_devices if torch.cuda.is_available() else 1,
+        devices=_trainer_devices,
         # Some RL4CO baselines / policies can have conditionally unused parameters.
         # Use find_unused_parameters when requested (safer but slightly slower).
         strategy=(
@@ -1182,8 +1264,16 @@ if __name__ == '__main__':
         max_len=MAX_LEN,
         embedding_model=embedding_model,
         seed=(None if base_seed is None else base_seed + 2),
+        precompute_token_embeddings=bool(args.precompute_token_embeddings),
     )
-    test_env = MaxSimEnv(generator=test_generator, max_segments=MAX_SEGMENTS, embedding_model=embedding_model, device=device)
+    test_env = MaxSimEnv(
+        generator=test_generator,
+        max_segments=MAX_SEGMENTS,
+        embedding_model=embedding_model,
+        device=device,
+        include_full_embedding=(not bool(args.no_full_embedding)),
+        use_fullcos_mix=(not bool(args.no_fullcos_mix)),
+    )
 
     test_size = int(TEST_DATA_SIZE_AVAILABLE)
     test_dataset = test_env.dataset(test_size, phase="test")

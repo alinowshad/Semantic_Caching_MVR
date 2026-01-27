@@ -203,6 +203,7 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
         candidate_k: int = 10,
         use_cached_candidate_segments: bool = False,
         multivector_max_elements: int = 2_000_000,
+        mix_fullcos: bool = False,
     ):
         self.bayesian = _Algorithm(delta=delta)
         self.similarity_evaluator: Optional[SimilarityEvaluator] = None
@@ -216,6 +217,9 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
         # RL splitter instance (expected: vcache.vcache_core.splitter.MaxSimSplitter.MaxSimSplitter)
         self.splitter = splitter
         self.device = device
+        # If True, use 0.5*(MaxSim + cosine(full_embed_no_cls)) as the similarity score (both in [0,1]).
+        # If False, use MaxSim only.
+        self.mix_fullcos = bool(mix_fullcos)
         # How to choose which cached prompts to score with MaxSim:
         # - "top_k": get k candidates from the vector DB (fast), then rerank by MaxSim (accurate).
         # - "all": score against all cached prompts by MaxSim (slow, but MaxSim everywhere).
@@ -236,12 +240,9 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
     @staticmethod
     def _maxsim_from_tensors(query_tensor, corpus_tensor) -> float:
         """
-        Compute symmetric MaxSim similarity in raw cosine space (typically [-1, 1]) given:
-          - query_tensor:  [S_q+1, H] (last row is full embed)
-          - corpus_tensor: [S_c+1, H] (last row is full embed)
-
-        NOTE: We intentionally treat the full embedding (last row) as an additional "segment"
-        for MaxSim, so it participates in the MaxSim row/col aggregation.
+        Compute symmetric MaxSim similarity and return it in **[0, 1]** given:
+          - query_tensor:  [S_q, H] (segment embeddings)
+          - corpus_tensor: [S_c, H] (segment embeddings)
         """
         import torch
         import torch.nn.functional as F
@@ -251,7 +252,7 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
         qt = query_tensor.to(dtype=torch.float32)
         ct = corpus_tensor.to(dtype=torch.float32, device=qt.device)
 
-        # MaxSim over *all* rows, including the last "full embedding" row.
+        # MaxSim over all segment rows.
         query_vectors = qt
         corpus_vectors = ct
         if query_vectors.shape[0] > 0 and corpus_vectors.shape[0] > 0:
@@ -273,7 +274,26 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
         # Weighted mix between row/col (uniform by default).
         mix = torch.softmax(torch.tensor([0.0, 0.0], device=dev, dtype=torch.float32), dim=0)
         raw = mix[0] * row_score + mix[1] * col_score
-        return float(raw.item())
+        # Map cosine-like similarity from [-1, 1] to [0, 1] to match the policy/Bayesian assumptions.
+        s01 = ((raw + 1.0) * 0.5).clamp(0.0, 1.0)
+        return float(s01.item())
+
+    @staticmethod
+    def _cos01(a: "torch.Tensor", b: "torch.Tensor") -> float:
+        """Cosine similarity mapped to [0,1]. Accepts [H] or [1,H] tensors."""
+        import torch
+        import torch.nn.functional as F
+
+        aa = a
+        bb = b
+        if aa.dim() == 1:
+            aa = aa.unsqueeze(0)
+        if bb.dim() == 1:
+            bb = bb.unsqueeze(0)
+        # Compute cosine in [-1,1], then map to [0,1]
+        cos = F.cosine_similarity(F.normalize(aa.float(), p=2, dim=-1), F.normalize(bb.float(), p=2, dim=-1), dim=-1)
+        s01 = ((cos + 1.0) * 0.5).clamp(0.0, 1.0)
+        return float(s01.mean().item())
 
     def _maybe_cache_candidate_segments(self, embedding_id: int) -> None:
         """
@@ -392,8 +412,17 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
                 "VerifiedSplitterDecisionPolicy requires torch to compute MaxSim similarity."
             ) from e
 
-        query_tensor, corpus_tensor = self.splitter.split_pair_return_maxsim_tensors(query, candidate)
-        return self._maxsim_from_tensors(query_tensor, corpus_tensor)
+        if not bool(getattr(self, "mix_fullcos", False)):
+            query_tensor, corpus_tensor = self.splitter.split_pair_return_maxsim_tensors(query, candidate)
+            return self._maxsim_from_tensors(query_tensor, corpus_tensor)
+
+        # Mixed mode: compute MaxSim + cosine(full_embed_no_cls)
+        qenc = self.splitter.encode_text(query)
+        cenc = self.splitter.encode_text(candidate)
+        query_tensor, corpus_tensor = self.splitter.split_pair_return_maxsim_tensors_from_encoded(qenc, cenc)
+        maxsim01 = self._maxsim_from_tensors(query_tensor, corpus_tensor)
+        fullcos01 = self._cos01(qenc["pooled_no_cls"], cenc["pooled_no_cls"])
+        return 0.5 * (float(maxsim01) + float(fullcos01))
 
     def _maxsim_similarity_from_encoded(self, query_enc: dict, candidate_prompt: str) -> float:
         """
@@ -417,7 +446,11 @@ class VerifiedSplitterDecisionPolicy(VCachePolicy):
             pass
 
         query_tensor, corpus_tensor = self.splitter.split_pair_return_maxsim_tensors_from_encoded(query_enc, cand_enc)
-        return self._maxsim_from_tensors(query_tensor, corpus_tensor)
+        maxsim01 = self._maxsim_from_tensors(query_tensor, corpus_tensor)
+        if not bool(getattr(self, "mix_fullcos", False)):
+            return float(maxsim01)
+        fullcos01 = self._cos01(query_enc["pooled_no_cls"], cand_enc["pooled_no_cls"])
+        return 0.5 * (float(maxsim01) + float(fullcos01))
 
     def _select_nn_by_maxsim(
         self, prompt: str

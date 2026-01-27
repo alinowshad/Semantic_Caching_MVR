@@ -46,6 +46,7 @@ import argparse
 from datetime import datetime
 import json
 import os
+import sys
 import time
 import warnings
 from typing import Any, Dict, List, Tuple
@@ -57,6 +58,19 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from benchmarks.common.comparison import answers_have_same_meaning_static
+
+# --------------------------------------------------------------------------------------
+# IMPORTANT: ensure we import the *local repo* `vcache/` package, not an installed copy.
+#
+# When running this file directly via an absolute path, Python adds only the `benchmarks/`
+# directory to sys.path, which can cause `import vcache` to resolve to a different package
+# (e.g. the sibling `vcahce/` repo or a pip-installed `vcache`).
+# --------------------------------------------------------------------------------------
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))  # .../vcache_Multi_HNSW
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from vcache.config import VCacheConfig
 from vcache.main import VCache
 from vcache.vcache_core.cache.embedding_engine.strategies.bge import (
@@ -127,6 +141,9 @@ def _get_id_set(row: Dict[str, Any]) -> int:
     v = row.get("id_set", -1)
     if v == -1:
         v = row.get("ID_Set", -1)
+    # Fallback for custom datasets: allow using `label_id` as the benchmark id_set label.
+    if v == -1:
+        v = row.get("label_id", -1)
     try:
         return int(v)
     except Exception:
@@ -186,7 +203,13 @@ def main() -> None:
         help="Embedding column (optional, no longer used for embeddings as BGE is live).",
     )
     parser.add_argument(
-        "--llm-col", required=True, help="LLM response column, e.g. response_llama_3_8b"
+        "--llm-col",
+        required=False,
+        default=None,
+        help=(
+            "LLM response column, e.g. response_llama_3_8b. "
+            "Optional when --similarity-evaluator=benchmark_id_set (label-only evaluation)."
+        ),
     )
     parser.add_argument(
         "--max-samples",
@@ -225,6 +248,22 @@ def main() -> None:
         default=0,
         help="Allow overlapping segments by this many tokens on each segment boundary (default: 0). "
              "Set to 1 to allow 1-token overlap.",
+    )
+    parser.add_argument(
+        "--include-full-embedding",
+        action="store_true",
+        help=(
+            "If set, append the full pooled embedding (no-CLS mean) as an extra row in the MaxSim tensors, "
+            "in addition to segment embeddings. Default: segment embeddings only."
+        ),
+    )
+    parser.add_argument(
+        "--mix-fullcos",
+        action="store_true",
+        help=(
+            "If set, use similarity = 0.5*(MaxSim + cosine(full_embed_no_cls)) where both terms are mapped to [0,1]. "
+            "Default: MaxSim only."
+        ),
     )
     parser.add_argument(
         "--candidate-selection",
@@ -338,16 +377,15 @@ def main() -> None:
             raise ValueError(
                 f"Local dataset is missing required column 'prompt'. Available columns: {list(df.columns)}"
             )
-        if args.llm_col not in df.columns:
-            raise ValueError(
-                f"Local dataset is missing required LLM response column '{args.llm_col}'. Available columns: {list(df.columns)}"
-            )
 
         id_col = None
         if "ID_Set" in df.columns:
             id_col = "ID_Set"
         elif "id_set" in df.columns:
             id_col = "id_set"
+        elif "label_id" in df.columns:
+            # Custom dataset: treat label_id as id_set label.
+            id_col = "label_id"
 
         if args.similarity_evaluator == "benchmark_id_set":
             has_usable_ids = False
@@ -359,6 +397,17 @@ def main() -> None:
                     has_usable_ids = False
             if not has_usable_ids:
                 args.similarity_evaluator = "string"
+        # If we fell back to string evaluation, we MUST have a response column.
+        if args.similarity_evaluator == "string":
+            if args.llm_col is None or str(args.llm_col) == "":
+                raise ValueError(
+                    "similarity-evaluator='string' requires --llm-col, but none was provided. "
+                    f"Available columns: {list(df.columns)}"
+                )
+            if args.llm_col not in df.columns:
+                raise ValueError(
+                    f"Local dataset is missing required LLM response column '{args.llm_col}'. Available columns: {list(df.columns)}"
+                )
 
         rows = df.to_dict("records")
         if args.max_samples is not None:
@@ -401,6 +450,7 @@ def main() -> None:
         device=args.splitter_device,
         embedding_model=shared_embedder,
         overlap_tokens=int(args.splitter_overlap_tokens),
+        include_full_embedding=bool(args.include_full_embedding),
     )
 
     if args.similarity_evaluator == "string":
@@ -597,6 +647,7 @@ def main() -> None:
             candidate_k=int(candidate_k),
             use_cached_candidate_segments=bool(args.use_cached_candidate_segments),
             multivector_max_elements=int(args.multivector_max_elements),
+            mix_fullcos=bool(args.mix_fullcos),
         )
         vcache = VCache(config=config, policy=policy)
 
@@ -623,18 +674,20 @@ def main() -> None:
             hit_samples_f = open(hit_samples_path, "w", encoding="utf-8")
 
         t0 = time.time()
-        pbar = tqdm(
-            rows,
-            desc=f"Evaluating (Splitter) run={run_i}/{len(run_grid)} delta={delta} k={candidate_k}",
-            unit="samples",
-        )
+        desc_base = f"Evaluating (Splitter) run={run_i}/{len(run_grid)} delta={delta} k={candidate_k}"
+        pbar = tqdm(rows, desc=desc_base, unit="samples")
         try:
             for r in pbar:
                 prompt = r["prompt"]
                 system_prompt = r.get("output_format", "") or ""
                 id_set = _get_id_set(r)
 
-                label_response = r[args.llm_col]
+                # Only require/consume response strings when using string-based correctness.
+                if args.similarity_evaluator == "string":
+                    label_response = r[args.llm_col]
+                else:
+                    label_response = ""
+                # BenchmarkInferenceEngine expects set_next_response() to set the attribute.
                 inference_engine.set_next_response(label_response)
 
                 step_t0 = time.time()
@@ -704,7 +757,12 @@ def main() -> None:
                     }
                     hit_samples_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-                pbar.set_postfix({"hits": f"{hits}/{n}", "hit_rate": f"{(hits/n):.1%}"})
+                # Put hit stats in the *description* so it doesn't get truncated off the right side.
+                # (tqdm's postfix is often cut in narrow terminals.)
+                try:
+                    pbar.set_description(f"{desc_base} hits={hits}/{n} ({(hits/n):.1%})")
+                except Exception:
+                    pass
 
                 if args.sleep and args.sleep > 0:
                     time.sleep(float(args.sleep))

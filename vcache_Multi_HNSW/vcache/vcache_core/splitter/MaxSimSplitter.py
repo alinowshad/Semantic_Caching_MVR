@@ -98,10 +98,21 @@ def _resolve_checkpoint_path(checkpoint_path: str) -> str:
 
     raise FileNotFoundError(f"Checkpoint path not found: {p}")
 class MaxSimSplitter:
-    def __init__(self, checkpoint_path, device="cuda", embedding_model=None, *, overlap_tokens: int = 0):
+    def __init__(
+        self,
+        checkpoint_path,
+        device="cuda",
+        embedding_model=None,
+        *,
+        overlap_tokens: int = 0,
+        include_full_embedding: bool = False,
+    ):
         # Normalize device early so all downstream `.to(...)` calls are consistent.
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.overlap_tokens = max(0, int(overlap_tokens))
+        # If True, append the full pooled embedding (no-CLS mean) as an extra row to MaxSim tensors.
+        # This matches the older behavior some experiments used.
+        self.include_full_embedding = bool(include_full_embedding)
         resolved_ckpt = _resolve_checkpoint_path(checkpoint_path)
         print(f"正在加载分句模型: {resolved_ckpt} ...")
         
@@ -260,12 +271,10 @@ class MaxSimSplitter:
         """
         Fast path for MaxSim: run the RL splitter ONCE (tokenizer + LM forward + policy decode),
         then reuse the LM token embeddings to build:
-          - query_tensor  = [segment_embeds..., full_embed]
-          - corpus_tensor = [segment_embeds..., full_embed]
+          - query_tensor  = [segment_embeds...]
+          - corpus_tensor = [segment_embeds...]
 
         This avoids re-encoding decoded segment strings via EmbeddingModel.get_embeddings_tensor.
-
-        Tensor semantics match `MaxSimEnv.raw_score_text`: the last row is the "full text" embedding.
         """
         import torch
 
@@ -342,8 +351,13 @@ class MaxSimSplitter:
         sent_a, full_a = _segment_embeds(token_emb_a, attn_a, pointers_a)
         sent_b, full_b = _segment_embeds(token_emb_b, attn_b, pointers_b)
 
-        query_tensor = torch.cat([sent_a, full_a], dim=0).to(dtype=torch.float32)
-        corpus_tensor = torch.cat([sent_b, full_b], dim=0).to(dtype=torch.float32)
+        if self.include_full_embedding:
+            query_tensor = torch.cat([sent_a, full_a], dim=0).to(dtype=torch.float32)
+            corpus_tensor = torch.cat([sent_b, full_b], dim=0).to(dtype=torch.float32)
+        else:
+            # Default: segment embeddings only.
+            query_tensor = sent_a.to(dtype=torch.float32)
+            corpus_tensor = sent_b.to(dtype=torch.float32)
         return query_tensor, corpus_tensor
 
     def encode_text(self, text: str) -> dict:
@@ -454,7 +468,7 @@ class MaxSimSplitter:
         """
         Segment a single already-encoded text using the policy's single-text decoder and
         return a MaxSim tensor:
-          tensor: [S+1, H] where last row is full_embed and first S rows are segment embeds.
+          tensor: [S, H] (segment embeddings only; no full embedding row).
         """
         import torch
 
@@ -482,8 +496,12 @@ class MaxSimSplitter:
             actions = torch.as_tensor(actions, device=self.device)
         pointers = actions.tolist()
 
-        sent, full = self._segment_embeds_from_pointers(tok, length, pointers, overlap_tokens=self.overlap_tokens)
-        return torch.cat([sent, full], dim=0)
+        sent, full = self._segment_embeds_from_pointers(
+            tok, length, pointers, overlap_tokens=self.overlap_tokens
+        )
+        if self.include_full_embedding:
+            return torch.cat([sent, full], dim=0).to(dtype=torch.float32)
+        return sent.to(dtype=torch.float32)
 
     def split_text_return_maxsim_tensor(self, text: str):
         """
@@ -569,9 +587,14 @@ class MaxSimSplitter:
         sent_a, full_a = self._segment_embeds_from_pointers(tok_a, la, pointers_a)
         sent_b, full_b = self._segment_embeds_from_pointers(tok_b, lb, pointers_b)
 
-        query_tensor = torch.cat([sent_a, full_a], dim=0)
-        corpus_tensor = torch.cat([sent_b, full_b], dim=0)
-        return query_tensor, corpus_tensor
+        if self.include_full_embedding:
+            return (
+                torch.cat([sent_a, full_a], dim=0).to(dtype=torch.float32),
+                torch.cat([sent_b, full_b], dim=0).to(dtype=torch.float32),
+            )
+
+        # Default: segment embeddings only.
+        return sent_a.to(dtype=torch.float32), sent_b.to(dtype=torch.float32)
 
     def debug_split_pair(self, text_a: str, text_b: str) -> dict:
         """
@@ -637,14 +660,14 @@ class MaxSimSplitter:
 
         segments_a = get_segments_from_token_pointers(
             tokenizer=self.generator.tokenizer,
-            input_ids=inputs_a["input_ids"][0],
-            attention_mask=inputs_a["attention_mask"][0],
+            input_ids=input_ids_a[0],
+            attention_mask=attention_mask_a[0],
             pointers=pointers_a,
         )
         segments_b = get_segments_from_token_pointers(
             tokenizer=self.generator.tokenizer,
-            input_ids=inputs_b["input_ids"][0],
-            attention_mask=inputs_b["attention_mask"][0],
+            input_ids=input_ids_b[0],
+            attention_mask=attention_mask_b[0],
             pointers=pointers_b,
         )
 
@@ -653,7 +676,7 @@ class MaxSimSplitter:
             "pointers_b": pointers_b,
             "segments_a": segments_a,
             "segments_b": segments_b,
-            "length_a": int(inputs_a["attention_mask"][0].sum().item()),
-            "length_b": int(inputs_b["attention_mask"][0].sum().item()),
+            "length_a": int(attention_mask_a[0].sum().item()),
+            "length_b": int(attention_mask_b[0].sum().item()),
             "policy_info": out.get("info", {}),
         }

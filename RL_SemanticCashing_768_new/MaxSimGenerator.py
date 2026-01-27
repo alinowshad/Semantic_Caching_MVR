@@ -34,6 +34,7 @@ class MaxSimGenerator(Generator):
         label_mode: str = "none",  # none|auto|id_set|string
         response_column: str | None = None,
         return_row_indices: bool = False,
+        precompute_token_embeddings: bool = False,
         sampling_mode: str = "pairs",
         nn_warmup_epochs: int = 5,
         nn_candidate_topk: int = 50,
@@ -58,6 +59,7 @@ class MaxSimGenerator(Generator):
         self.label_mode = str(label_mode).lower().strip()
         self.response_column = response_column
         self.return_row_indices = bool(return_row_indices)
+        self.precompute_token_embeddings = bool(precompute_token_embeddings)
         self.nn_warmup_epochs = int(nn_warmup_epochs)
         self.nn_candidate_topk = int(nn_candidate_topk)
         self.nn_full_pairwise = bool(nn_full_pairwise)
@@ -200,6 +202,16 @@ class MaxSimGenerator(Generator):
         self.tokenizer = self.embedding_model.tokenizer
         self.lm = self.embedding_model.model
 
+        # ------------------------------------------------------------
+        # Optional in-RAM cache for token-level embeddings
+        # ------------------------------------------------------------
+        self._tok_cache_ready = False
+        self._tok_cache_input_ids = None          # torch.LongTensor [N, L]
+        self._tok_cache_attention_mask = None     # torch.BoolTensor [N, L]
+        self._tok_cache_last_hidden_state = None  # torch.(Float/Half)Tensor [N, L, H] on CPU
+        self._tok_cache_universe = None           # list[str] used for cache (alignment)
+        self._tok_cache_prompt_to_idx = None      # dict[str,int] for mapping (pairs mode)
+
         # ----------------------------
         # Anchor / reverse-NN sampling state (optional)
         # ----------------------------
@@ -262,6 +274,112 @@ class MaxSimGenerator(Generator):
             self.rebuild_nn_index(epoch=0, policy=None, env=None)
         elif self.sampling_mode not in {"pairs", "random"}:
             raise ValueError(f"Unsupported sampling_mode={sampling_mode!r}. Use 'pairs', 'random', or 'anchor_nn'.")
+
+        # If requested, precompute token embeddings for the full prompt universe (CPU RAM).
+        # This speeds up sampling by avoiding LM forward passes per batch.
+        if self.precompute_token_embeddings:
+            try:
+                self._build_token_cache()
+            except Exception as e:
+                raise RuntimeError(f"Failed to precompute token embeddings cache: {e}")
+
+    def _estimate_cache_bytes(self, *, n: int, l: int, h: int, dtype: torch.dtype) -> int:
+        bytes_per = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+        # last_hidden_state dominates
+        return int(n * l * h * bytes_per)
+
+    def _build_token_cache(self):
+        # Decide which prompt universe to cache:
+        # - anchor_nn: cache the universe used for NN sampling (self._all_prompts)
+        # - random/parquet prompts: cache self.prompts
+        universe = None
+        if getattr(self, "_all_prompts", None) is not None:
+            universe = list(self._all_prompts)
+        elif self.prompts is not None:
+            universe = list(self.prompts)
+        else:
+            # pairs-only mode without an explicit universe; nothing sensible to cache
+            print("[GEN][tok_cache] precompute requested but no prompt universe available; skipping.")
+            return
+
+        # Heuristic: store hidden states as float16 to reduce memory.
+        # IMPORTANT: keep the cache on the LM device (usually GPU) so we avoid CPU->GPU copies per step.
+        cache_dtype = torch.float16
+        try:
+            # Try to infer hidden size from model config
+            h = int(getattr(getattr(self.lm, "config", None), "hidden_size", 768))
+        except Exception:
+            h = 768
+        n = len(universe)
+        l = int(self.max_len)
+        est = self._estimate_cache_bytes(n=n, l=l, h=h, dtype=cache_dtype)
+        try:
+            est_gb = est / (1024**3)
+            print(f"[GEN][tok_cache] building token cache: N={n} L={l} H~={h} dtype={str(cache_dtype).replace('torch.', '')} est_hidden_mem≈{est_gb:.2f}GB")
+        except Exception:
+            pass
+
+        # Compute in batches on LM device and keep the cache on that device.
+        # NOTE: This is intentionally simple; no user-exposed batch size per request.
+        bs = 64
+        device = next(self.lm.parameters()).device
+        all_input_ids = []
+        all_attn = []
+        all_hid = []
+        for start in range(0, n, bs):
+            chunk = universe[start:start + bs]
+            out = self.embedding_model.get_token_embeddings(
+                chunk, max_length=self.max_len, device=device, return_device=device
+            )
+            # Standard keys from EmbeddingModel.get_token_embeddings
+            hid = out["last_hidden_state"].to(dtype=cache_dtype, copy=False)  # [b,L,H] on device
+            attn = out["attention_mask"].to(torch.bool, copy=False)          # [b,L] on device
+            ids = out["input_ids"].to(torch.long, copy=False)                # [b,L] on device
+            all_hid.append(hid)
+            all_attn.append(attn)
+            all_input_ids.append(ids)
+
+        self._tok_cache_last_hidden_state = torch.cat(all_hid, dim=0).contiguous()
+        self._tok_cache_attention_mask = torch.cat(all_attn, dim=0).contiguous()
+        self._tok_cache_input_ids = torch.cat(all_input_ids, dim=0).contiguous()
+        self._tok_cache_universe = universe
+        # Mapping helps when pairs-mode provides texts; we can map back to cached indices when possible.
+        self._tok_cache_prompt_to_idx = {p: i for i, p in enumerate(universe)}
+        self._tok_cache_ready = True
+        print(f"[GEN][tok_cache] ready: input_ids={tuple(self._tok_cache_input_ids.shape)} last_hidden_state={tuple(self._tok_cache_last_hidden_state.shape)}")
+
+    def _token_batch_from_cache(self, indices: np.ndarray | list[int] | torch.Tensor) -> dict:
+        if not self._tok_cache_ready:
+            raise RuntimeError("token cache not ready")
+        if isinstance(indices, torch.Tensor):
+            idx = indices.detach().long()
+        else:
+            idx = torch.tensor(list(indices), dtype=torch.long, device=self._tok_cache_input_ids.device)
+        ids = self._tok_cache_input_ids.index_select(0, idx)
+        attn = self._tok_cache_attention_mask.index_select(0, idx)
+        hid = self._tok_cache_last_hidden_state.index_select(0, idx)
+        return {"input_ids": ids, "attention_mask": attn, "last_hidden_state": hid}
+
+    def _pair_correct_by_indices(self, ia: int, ib: int) -> int | None:
+        # 1) pairs JSON lookup by string (if available)
+        if self._pair_label is not None and self._tok_cache_universe is not None:
+            try:
+                a = self._tok_cache_universe[int(ia)]
+                b = self._tok_cache_universe[int(ib)]
+                return self._pair_label.get((a, b), None)
+            except Exception:
+                return None
+        # 2) parquet label evaluator by row fields (if available)
+        if self._parquet_table is not None and self._label_evaluator is not None:
+            if isinstance(self._label_evaluator, IdSetSimilarityEvaluator):
+                id_a = self._parquet_id_vals[int(ia)] if self._parquet_id_vals is not None else None
+                id_b = self._parquet_id_vals[int(ib)] if self._parquet_id_vals is not None else None
+                return 1 if self._label_evaluator.answers_similar("", "", id_set_a=id_a, id_set_b=id_b) else 0
+            if isinstance(self._label_evaluator, StringComparisonSimilarityEvaluator):
+                ra = self._parquet_resp_vals[int(ia)] if self._parquet_resp_vals is not None else None
+                rb = self._parquet_resp_vals[int(ib)] if self._parquet_resp_vals is not None else None
+                return 1 if self._label_evaluator.answers_similar(ra, rb) else 0
+        return None
 
     def set_epoch(self, epoch: int, *, policy=None, env=None):
         """Called by a Lightning callback to let the generator refresh epoch-dependent sampling."""
@@ -332,7 +450,10 @@ class MaxSimGenerator(Generator):
             """
             n = int(emb.shape[0])
             kk = int(max(1, min(k, n - 1)))
-            emb2 = emb
+            # Prefer GPU for the NxN matmul when available (much faster for N~3k),
+            # but keep the result indices on CPU.
+            dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            emb2 = emb.to(dev, non_blocking=True)
             if dtype == "float16":
                 emb2 = emb2.to(dtype=torch.float16)
             else:
@@ -520,6 +641,8 @@ class MaxSimGenerator(Generator):
             N = len(self._all_prompts)
             texts_a = []
             texts_b = []
+            idx_a_list = []
+            idx_b_list = []
             correct_list = []
 
             # Fill bs pairs by repeatedly sampling anchors and their reverse-NN sets
@@ -540,13 +663,22 @@ class MaxSimGenerator(Generator):
                         break
                     a_txt = self._all_prompts[x]
                     b_txt = self._all_prompts[int(y)]
-                    lab = self._pair_correct(a_txt, b_txt)
+                    lab = None
+                    # If we can label by indices (parquet evaluator or pairs map), do it without string ops
+                    try:
+                        lab = self._pair_correct_by_indices(int(x), int(y))
+                    except Exception:
+                        lab = None
+                    if lab is None:
+                        lab = self._pair_correct(a_txt, b_txt)
                     if lab is None:
                         if self.nn_label_strategy == "skip":
                             continue
                         lab = 0
                     texts_a.append(a_txt)
                     texts_b.append(b_txt)
+                    idx_a_list.append(int(x))
+                    idx_b_list.append(int(y))
                     correct_list.append(int(lab))
 
             # Hard fallback: if we couldn't fill, fall back to existing pairs sampling
@@ -575,11 +707,19 @@ class MaxSimGenerator(Generator):
                     for a_i, b_i in zip(ia.tolist(), ib.tolist()):
                         a_txt = self._all_prompts[int(a_i)]
                         b_txt = self._all_prompts[int(b_i)]
-                        lab = self._pair_correct(a_txt, b_txt)
+                        lab = None
+                        try:
+                            lab = self._pair_correct_by_indices(int(a_i), int(b_i))
+                        except Exception:
+                            lab = None
+                        if lab is None:
+                            lab = self._pair_correct(a_txt, b_txt)
                         if lab is None:
                             lab = 0
                         texts_a.append(a_txt)
                         texts_b.append(b_txt)
+                        idx_a_list.append(int(a_i))
+                        idx_b_list.append(int(b_i))
                         correct_list.append(int(lab))
 
             correct = torch.tensor(correct_list[:bs], dtype=torch.float32)
@@ -630,19 +770,61 @@ class MaxSimGenerator(Generator):
         # print("----------------------------------------------------")
         # ==================================================================
 
-        # 使用 EmbeddingModel 获取token级别的嵌入
-        # Compute on `device` (often GPU) but return embeddings on CPU to avoid OOM when RL4CO
-        # pre-generates large datasets (thousands of samples).
-        token_embeds_a = self.embedding_model.get_token_embeddings(
-            texts_a, max_length=self.max_len, device=device, return_device=torch.device("cpu")
-        )
-        token_embeds_b = self.embedding_model.get_token_embeddings(
-            texts_b, max_length=self.max_len, device=device, return_device=torch.device("cpu")
-        )
+        # Token-level embeddings:
+        # - Default: compute on the fly with the LM (GPU) and return to CPU.
+        # - If precompute_token_embeddings enabled: gather from in-RAM cache (CPU) by row indices.
+        if self._tok_cache_ready:
+            if self.sampling_mode == "anchor_nn":
+                if len(idx_a_list) < bs or len(idx_b_list) < bs:
+                    # Safety fallback
+                    token_embeds_a = self.embedding_model.get_token_embeddings(
+                        texts_a, max_length=self.max_len, device=device, return_device=torch.device("cpu")
+                    )
+                    token_embeds_b = self.embedding_model.get_token_embeddings(
+                        texts_b, max_length=self.max_len, device=device, return_device=torch.device("cpu")
+                    )
+                else:
+                    token_embeds_a = self._token_batch_from_cache(idx_a_list[:bs])
+                    token_embeds_b = self._token_batch_from_cache(idx_b_list[:bs])
+            elif (not self.pairs_mode) and self.sampling_mode != "pairs":
+                token_embeds_a = self._token_batch_from_cache(indices_a.tolist())
+                token_embeds_b = self._token_batch_from_cache(indices_b.tolist())
+            else:
+                # pairs-mode randomization uses free-form strings; fall back unless we can map them
+                try:
+                    if self._tok_cache_prompt_to_idx is not None:
+                        ia = [self._tok_cache_prompt_to_idx.get(t, -1) for t in texts_a]
+                        ib = [self._tok_cache_prompt_to_idx.get(t, -1) for t in texts_b]
+                        if min(ia) >= 0 and min(ib) >= 0:
+                            token_embeds_a = self._token_batch_from_cache(ia)
+                            token_embeds_b = self._token_batch_from_cache(ib)
+                        else:
+                            raise RuntimeError("some pair texts not found in cache universe")
+                    else:
+                        raise RuntimeError("no cache mapping available")
+                except Exception:
+                    token_embeds_a = self.embedding_model.get_token_embeddings(
+                        texts_a, max_length=self.max_len, device=device, return_device=torch.device("cpu")
+                    )
+                    token_embeds_b = self.embedding_model.get_token_embeddings(
+                        texts_b, max_length=self.max_len, device=device, return_device=torch.device("cpu")
+                    )
+        else:
+            # Compute on `device` (often GPU) but return embeddings on CPU to avoid OOM when RL4CO
+            # pre-generates large datasets (thousands of samples).
+            token_embeds_a = self.embedding_model.get_token_embeddings(
+                texts_a, max_length=self.max_len, device=device, return_device=torch.device("cpu")
+            )
+            token_embeds_b = self.embedding_model.get_token_embeddings(
+                texts_b, max_length=self.max_len, device=device, return_device=torch.device("cpu")
+            )
         
-        embeddings_a = token_embeds_a['last_hidden_state']
+        # Policy uses Conv1d/Linear layers whose params are float32 by default.
+        # Ensure embeddings are float32 to avoid "Input type (Half) and bias type (float)" errors,
+        # especially when using the in-RAM cache (which may store float16 to save RAM).
+        embeddings_a = token_embeds_a['last_hidden_state'].to(dtype=torch.float32)
         mask_a = token_embeds_a['attention_mask'].to(torch.bool)
-        embeddings_b = token_embeds_b['last_hidden_state']
+        embeddings_b = token_embeds_b['last_hidden_state'].to(dtype=torch.float32)
         mask_b = token_embeds_b['attention_mask'].to(torch.bool)
        
         inputs_a = {
@@ -673,7 +855,8 @@ class MaxSimGenerator(Generator):
                 "length_b": lengths_b,
             },
             batch_size=[bs],
-            device=torch.device("cpu"),
+            # Keep TensorDict on the same device as embeddings to avoid CPU->GPU copies in env/policy/reward.
+            device=embeddings_a.device,
         )
         # If requested, return row indices so the caller can look up other fields in the parquet table
         # (strings like responses are not stored in TensorDict; use these indices to index the table/df externally).

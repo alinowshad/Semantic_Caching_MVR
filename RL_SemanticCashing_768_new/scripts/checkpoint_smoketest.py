@@ -102,7 +102,8 @@ def main() -> None:
 
     # Preferred: Lightning-style load (will call on_load_checkpoint hooks)
     print(f"[LOAD] Loading checkpoint: {args.ckpt}")
-    model = ResumeFriendlyREINFORCE.load_from_checkpoint(args.ckpt, **model_kwargs, strict=False)
+    # Fix for PyTorch 2.6+ weights_only=True default
+    model = ResumeFriendlyREINFORCE.load_from_checkpoint(args.ckpt, **model_kwargs, strict=False, weights_only=False)
     model.strict_loading = False
     model.to(device)
     model.eval()
